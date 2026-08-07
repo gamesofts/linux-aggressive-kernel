@@ -1,0 +1,454 @@
+name: Build Linux Aggressive Kernel
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/build-aggressive-kernel.yml"
+      - "metadata/**"
+      - "scripts/**"
+      - "kernel.sh"
+      - "tests/**"
+      - "README.md"
+      - "docs/**"
+  pull_request:
+    paths:
+      - ".github/workflows/build-aggressive-kernel.yml"
+      - "metadata/**"
+      - "scripts/**"
+      - "kernel.sh"
+      - "tests/**"
+      - "README.md"
+      - "docs/**"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild an existing release
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    - cron: "23 3 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && format('linux-aggressive-kernel-pr-{0}', github.event.pull_request.number) || 'linux-aggressive-kernel-release' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      build_needed: ${{ steps.plan.outputs.build_needed }}
+      release_tag: ${{ steps.plan.outputs.release_tag }}
+      upstream_kernel_version: ${{ steps.plan.outputs.upstream_kernel_version }}
+      linux_source_sha256: ${{ steps.plan.outputs.linux_source_sha256 }}
+      recipe_sha256: ${{ steps.plan.outputs.recipe_sha256 }}
+      build_sha256: ${{ steps.plan.outputs.build_sha256 }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Run repository tests
+        run: bash tests/run.sh
+
+      - name: Resolve deterministic build inputs
+        id: plan
+        run: |
+          set -euo pipefail
+          bash scripts/resolve-stable-kernel.sh | tee kernel-version.env
+          source kernel-version.env
+          bash scripts/resolve-linux-source.sh "$UPSTREAM_KERNEL_VERSION" | tee linux-source.env
+          source linux-source.env
+          source metadata/aggressive-bbr.env
+
+          [[ "$PROFILE_NAME" == linux-aggressive-bbr-v1 ]]
+          [[ "$BBR_TUNING_REVISION" == 5 ]]
+          [[ "$BBR_BW_RTTS" == 10 ]]
+          [[ "$BBR_PIXIE_FEEDBACK_ENTRY_RTTS" == 1 ]]
+          [[ "$BBR_PIXIE_FEEDBACK_EXIT_RTTS" == 4 ]]
+          [[ "$BBR_PIXIE_MIN_SAMPLES" == 32 ]]
+          [[ "$BBR_PIXIE_MAX_GAIN_PERCENT" == 150 ]]
+          [[ "$BBR_LT_LOSS_THRESH" == 96 ]]
+          [[ "$BBR_LT_BW_MAX_RTTS" == 24 ]]
+          [[ "$LINUX_SOURCE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+
+          recipe_files=(
+            .github/workflows/build-aggressive-kernel.yml
+            metadata/aggressive-bbr.env
+            scripts/apply-aggressive-bbr.py
+            scripts/fetch-verified-linux.sh
+            scripts/prepare-kernel-config.sh
+            scripts/resolve-linux-source.sh
+            scripts/resolve-stable-kernel.sh
+          )
+          recipe_sha256=$(sha256sum "${recipe_files[@]}" | sha256sum | awk '{ print $1 }')
+          build_sha256=$(
+            printf '%s\n' \
+              "$BBR_TUNING_REVISION" "$BBR_BW_RTTS" \
+              "$BBR_PIXIE_FEEDBACK_ENTRY_RTTS" "$BBR_PIXIE_FEEDBACK_EXIT_RTTS" \
+              "$BBR_PIXIE_MIN_SAMPLES" "$BBR_PIXIE_MAX_GAIN_PERCENT" \
+              "$BBR_LT_LOSS_THRESH" "$BBR_LT_BW_MAX_RTTS" \
+              "$LINUX_SOURCE_SHA256" "$recipe_sha256" \
+              | sha256sum | awk '{ print $1 }'
+          )
+          release_tag="v${UPSTREAM_KERNEL_VERSION}-aggressive-${build_sha256:0:12}"
+
+          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+          echo "upstream_kernel_version=$UPSTREAM_KERNEL_VERSION" >> "$GITHUB_OUTPUT"
+          echo "linux_source_sha256=$LINUX_SOURCE_SHA256" >> "$GITHUB_OUTPUT"
+          echo "recipe_sha256=$recipe_sha256" >> "$GITHUB_OUTPUT"
+          echo "build_sha256=$build_sha256" >> "$GITHUB_OUTPUT"
+
+          if [[ "${{ github.event_name }}" != "pull_request" ]] && \
+             gh release view "$release_tag" >/dev/null 2>&1 && \
+             [[ "${{ inputs.force || false }}" != "true" ]]; then
+            echo "build_needed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "build_needed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: plan
+    if: needs.plan.outputs.build_needed == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            rpm_arch: x86_64
+            runner: ubuntu-24.04
+          - arch: arm64
+            rpm_arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 330
+    env:
+      BUILD_ARCH: ${{ matrix.arch }}
+      RPM_ARCH: ${{ matrix.rpm_arch }}
+      UPSTREAM_KERNEL_VERSION: ${{ needs.plan.outputs.upstream_kernel_version }}
+      LINUX_SOURCE_SHA256: ${{ needs.plan.outputs.linux_source_sha256 }}
+      RECIPE_SHA256: ${{ needs.plan.outputs.recipe_sha256 }}
+      BUILD_SHA256: ${{ needs.plan.outputs.build_sha256 }}
+      LOCALVERSION: -aggressive
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc binutils bison build-essential ca-certificates cpio curl debhelper \
+            dpkg-dev dwarves fakeroot flex git gnupg jq kmod libdw-dev libelf-dev \
+            libncurses-dev libssl-dev lz4 patch pkg-config python3 rpm rsync xz-utils zstd \
+            clang llvm lld
+
+      - name: Download verified stable Linux source
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          bash scripts/fetch-verified-linux.sh \
+            "$UPSTREAM_KERNEL_VERSION" build/linux.tar.xz \
+            build/linux-source-provenance.env
+          source build/linux-source-provenance.env
+          [[ "$LINUX_SOURCE_SHA256" == "${{ needs.plan.outputs.linux_source_sha256 }}" ]]
+          tar -C build -xf build/linux.tar.xz
+          mv "build/linux-${UPSTREAM_KERNEL_VERSION}" build/linux
+
+      - name: Verify upstream BBR source
+        working-directory: build/linux
+        run: |
+          set -euo pipefail
+          test -f net/ipv4/tcp_bbr.c
+          grep -Fq '"bbr"' net/ipv4/tcp_bbr.c
+          sha256sum net/ipv4/tcp_bbr.c > "$GITHUB_WORKSPACE/build/upstream-bbr.sha256"
+
+      - name: Apply aggressive BBR loss compensation
+        working-directory: build/linux
+        run: |
+          set -euo pipefail
+          python3 "$GITHUB_WORKSPACE/scripts/apply-aggressive-bbr.py" \
+            net/ipv4/tcp_bbr.c "$GITHUB_WORKSPACE/build/bbr-tuning.env"
+          source "$GITHUB_WORKSPACE/build/bbr-tuning.env"
+          [[ "$BBR_BW_RTTS" == 10 ]]
+          [[ "$BBR_PIXIE_FEEDBACK_ENTRY_RTTS" == 1 ]]
+          [[ "$BBR_PIXIE_FEEDBACK_EXIT_RTTS" == 4 ]]
+          [[ "$BBR_PIXIE_MIN_SAMPLES" == 32 ]]
+          [[ "$BBR_PIXIE_FEEDBACK_WINDOW" == adaptive_hysteresis_completed_rounds ]]
+          [[ "$BBR_PIXIE_MAX_GAIN_PERCENT" == 150 ]]
+          [[ "$BBR_PIXIE_IDLE_RESET" == 1 ]]
+          [[ "$BBR_PIXIE_CWND_SATURATING_ARITHMETIC" == 1 ]]
+          [[ "$BBR_PIXIE_CWND_GRADUAL_GROWTH" == 1 ]]
+          [[ "$BBR_PIXIE_POLICER_MODEL" == 0 ]]
+
+      - name: Prepare generic kernel configuration
+        working-directory: build/linux
+        run: |
+          set -euo pipefail
+          bash "$GITHUB_WORKSPACE/scripts/prepare-kernel-config.sh"
+          source "$GITHUB_WORKSPACE/build/bbr-tuning.env"
+          printf '%s  %s\n' "$BBR_TUNED_SOURCE_SHA256" net/ipv4/tcp_bbr.c | sha256sum --check --status
+          cp .config "$GITHUB_WORKSPACE/build/package.config"
+
+      - name: Compile Aggressive BBR with GCC
+        working-directory: build/linux
+        run: |
+          set -euo pipefail
+          make -j"$(nproc)" net/ipv4/tcp_bbr.o
+          test -s net/ipv4/tcp_bbr.o
+
+      - name: Compile Aggressive BBR with Clang
+        working-directory: build/linux
+        run: |
+          set -euo pipefail
+          clang_output="$GITHUB_WORKSPACE/build/linux-clang"
+          make mrproper
+          mkdir -p "$clang_output"
+          cp "$GITHUB_WORKSPACE/build/package.config" "$clang_output/.config"
+          make O="$clang_output" CC=clang LLVM=1 olddefconfig
+          make -j"$(nproc)" O="$clang_output" CC=clang LLVM=1 net/ipv4/tcp_bbr.o
+          test -s "$clang_output/net/ipv4/tcp_bbr.o"
+          cp "$GITHUB_WORKSPACE/build/package.config" .config
+          make olddefconfig
+
+      - name: Build DEB packages
+        working-directory: build/linux
+        run: |
+          set -euo pipefail
+          make -j"$(nproc)" bindeb-pkg \
+            LOCALVERSION="$LOCALVERSION" \
+            KDEB_PKGVERSION="${UPSTREAM_KERNEL_VERSION}-1+aggressive.${BUILD_SHA256:0:12}" \
+            KDEB_COMPRESS=xz
+
+      - name: Build RPM packages
+        working-directory: build/linux
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/build/rpmbuild"/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
+          make -j"$(nproc)" binrpm-pkg \
+            LOCALVERSION="$LOCALVERSION" \
+            RPMOPTS="--define '_topdir $GITHUB_WORKSPACE/build/rpmbuild'"
+          find "$GITHUB_WORKSPACE/build/rpmbuild/RPMS" -type f -name '*.rpm' -exec cp -f {} "$GITHUB_WORKSPACE/build/" \;
+
+      - name: Validate packages and create manifest fragment
+        run: |
+          set -euo pipefail
+          kernel_release="${UPSTREAM_KERNEL_VERSION}${LOCALVERSION}"
+
+          deb_contains_kernel() {
+            dpkg-deb --contents "$1" 2>/dev/null \
+              | awk -v image="./boot/vmlinuz-${kernel_release}" '$NF == image { found=1 } END { exit !found }'
+          }
+
+          rpm_contains_kernel() {
+            rpm -qpl "$1" 2>/dev/null \
+              | awk -v modules_image="/lib/modules/${kernel_release}/vmlinuz" \
+                    -v boot_image="/boot/vmlinuz-${kernel_release}" \
+                    '$0 == modules_image || $0 == boot_image { found=1 } END { exit !found }'
+          }
+
+          image_deb=""
+          for candidate in build/*.deb; do
+            [[ -f "$candidate" ]] || continue
+            [[ "$(dpkg-deb -f "$candidate" Architecture 2>/dev/null || true)" == "$BUILD_ARCH" ]] || continue
+            if deb_contains_kernel "$candidate"; then
+              image_deb="$candidate"
+              break
+            fi
+          done
+          if [[ -z "$image_deb" ]]; then
+            echo "::error::No $BUILD_ARCH DEB package contains /boot/vmlinuz-${kernel_release}"
+            for candidate in build/*.deb; do
+              [[ -f "$candidate" ]] || continue
+              printf 'DEB candidate: %s package=%s arch=%s\n' \
+                "$candidate" \
+                "$(dpkg-deb -f "$candidate" Package 2>/dev/null || true)" \
+                "$(dpkg-deb -f "$candidate" Architecture 2>/dev/null || true)"
+            done
+            exit 1
+          fi
+          deb_package=$(dpkg-deb -f "$image_deb" Package)
+          deb_version=$(dpkg-deb -f "$image_deb" Version)
+          deb_name="linux-aggressive-kernel-${UPSTREAM_KERNEL_VERSION}-${BUILD_ARCH}.deb"
+          mv "$image_deb" "build/$deb_name"
+          deb_sha256=$(sha256sum "build/$deb_name" | awk '{ print $1 }')
+
+          rpm_file=""
+          for candidate in build/*.rpm; do
+            [[ -f "$candidate" ]] || continue
+            [[ "$(rpm -qp --qf '%{ARCH}' "$candidate" 2>/dev/null || true)" == "$RPM_ARCH" ]] || continue
+            if rpm_contains_kernel "$candidate"; then
+              rpm_file="$candidate"
+              break
+            fi
+          done
+          if [[ -z "$rpm_file" ]]; then
+            echo "::error::No $RPM_ARCH RPM package contains the ${kernel_release} kernel image"
+            for candidate in build/*.rpm; do
+              [[ -f "$candidate" ]] || continue
+              printf 'RPM candidate: %s package=%s arch=%s\n' \
+                "$candidate" \
+                "$(rpm -qp --qf '%{NAME}' "$candidate" 2>/dev/null || true)" \
+                "$(rpm -qp --qf '%{ARCH}' "$candidate" 2>/dev/null || true)"
+            done
+            exit 1
+          fi
+          rpm_package=$(rpm -qp --qf '%{NAME}' "$rpm_file")
+          rpm_version=$(rpm -qp --qf '%{VERSION}-%{RELEASE}' "$rpm_file")
+          rpm_name="linux-aggressive-kernel-${UPSTREAM_KERNEL_VERSION}-${RPM_ARCH}.rpm"
+          mv "$rpm_file" "build/$rpm_name"
+          rpm_sha256=$(sha256sum "build/$rpm_name" | awk '{ print $1 }')
+
+          source metadata/aggressive-bbr.env
+          source build/linux-source-provenance.env
+          source build/bbr-tuning.env
+          final_config_sha256=$(sha256sum build/linux/.config | awk '{ print $1 }')
+
+          jq -n \
+            --arg architecture "$BUILD_ARCH" \
+            --arg upstream_kernel_version "$UPSTREAM_KERNEL_VERSION" \
+            --arg kernel_release "$kernel_release" \
+            --arg source_sha256 "$BBR_STOCK_SOURCE_SHA256" \
+            --arg built_source_sha256 "$BBR_TUNED_SOURCE_SHA256" \
+            --arg tuning_revision "$BBR_TUNING_REVISION" \
+            --arg bw_rtts "$BBR_BW_RTTS" \
+            --arg feedback_entry_rtts "$BBR_PIXIE_FEEDBACK_ENTRY_RTTS" \
+            --arg feedback_exit_rtts "$BBR_PIXIE_FEEDBACK_EXIT_RTTS" \
+            --arg min_samples "$BBR_PIXIE_MIN_SAMPLES" \
+            --arg max_gain_percent "$BBR_PIXIE_MAX_GAIN_PERCENT" \
+            --arg lt_loss_thresh "$BBR_LT_LOSS_THRESH" \
+            --arg lt_bw_max_rtts "$BBR_LT_BW_MAX_RTTS" \
+            --arg linux_source_sha256 "$LINUX_SOURCE_SHA256" \
+            --arg linux_signing_fingerprint "$LINUX_SOURCE_SIGNING_FINGERPRINT" \
+            --arg recipe_sha256 "$RECIPE_SHA256" \
+            --arg build_sha256 "$BUILD_SHA256" \
+            --arg deb_name "$deb_name" --arg deb_sha256 "$deb_sha256" \
+            --arg deb_package "$deb_package" --arg deb_version "$deb_version" \
+            --arg rpm_name "$rpm_name" --arg rpm_sha256 "$rpm_sha256" \
+            --arg rpm_package "$rpm_package" --arg rpm_version "$rpm_version" \
+            --arg final_config_sha256 "$final_config_sha256" \
+            '{
+              architecture: $architecture,
+              kernel: { upstream_version: $upstream_kernel_version, release: $kernel_release },
+              algorithm: {
+                name: "bbr", source: "linux-mainline", source_file: "net/ipv4/tcp_bbr.c",
+                source_sha256: $source_sha256, built_source_sha256: $built_source_sha256,
+                tuning: {
+                  revision: ($tuning_revision | tonumber), bw_rtts: ($bw_rtts | tonumber),
+                  feedback_entry_rtts: ($feedback_entry_rtts | tonumber),
+                  feedback_exit_rtts: ($feedback_exit_rtts | tonumber),
+                  min_samples: ($min_samples | tonumber),
+                  max_gain_percent: ($max_gain_percent | tonumber),
+                  lt_loss_thresh: ($lt_loss_thresh | tonumber),
+                  lt_bw_max_rtts: ($lt_bw_max_rtts | tonumber)
+                },
+                linux_source_sha256: $linux_source_sha256,
+                linux_signing_fingerprint: $linux_signing_fingerprint,
+                recipe_sha256: $recipe_sha256, build_sha256: $build_sha256
+              },
+              assets: {
+                deb: {image: {name: $deb_name, sha256: $deb_sha256, package: $deb_package, version: $deb_version}},
+                rpm: {image: {name: $rpm_name, sha256: $rpm_sha256, package: $rpm_package, version: $rpm_version}}
+              },
+              final_config_sha256: $final_config_sha256
+            }' > "build/manifest-${BUILD_ARCH}.json"
+
+      - name: Upload architecture artifacts
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: kernel-${{ matrix.arch }}
+          path: |
+            build/linux-aggressive-kernel-*.deb
+            build/linux-aggressive-kernel-*.rpm
+            build/manifest-${{ matrix.arch }}.json
+          if-no-files-found: error
+
+  publish:
+    needs: [plan, build]
+    if: needs.plan.outputs.build_needed == 'true' && github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ needs.plan.outputs.release_tag }}
+      UPSTREAM_KERNEL_VERSION: ${{ needs.plan.outputs.upstream_kernel_version }}
+      BUILD_SHA256: ${{ needs.plan.outputs.build_sha256 }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Download architecture artifacts
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          pattern: kernel-*
+          path: build
+          merge-multiple: true
+
+      - name: Create release manifest
+        run: |
+          set -euo pipefail
+          jq -e -s '
+            length == 2 and
+            (map(.architecture) | sort) == ["amd64", "arm64"] and
+            (map(.kernel.upstream_version) | unique | length) == 1 and
+            (map(.kernel.release) | unique | length) == 1 and
+            (map(.algorithm.name) | unique) == ["bbr"] and
+            (map(.algorithm.source) | unique) == ["linux-mainline"] and
+            (map(.algorithm.source_sha256) | unique | length) == 1 and
+            (map(.algorithm.built_source_sha256) | unique | length) == 1 and
+            (map(.algorithm.build_sha256) | unique | length) == 1
+          ' build/manifest-*.json >/dev/null
+
+          jq -s --arg release_tag "$RELEASE_TAG" '
+            .[0] as $base |
+            {
+              schema: 2,
+              profile: "linux-aggressive-bbr-v1",
+              release_tag: $release_tag,
+              kernel: $base.kernel,
+              algorithm: $base.algorithm,
+              config_sha256: (reduce .[] as $fragment ({}; .[$fragment.architecture] = $fragment.final_config_sha256)),
+              assets: (reduce .[] as $fragment ({}; .[$fragment.architecture] = $fragment.assets))
+            }
+          ' build/manifest-*.json > build/manifest.json
+          (cd build && sha256sum linux-aggressive-kernel-*.deb linux-aggressive-kernel-*.rpm manifest.json | sort -k2) > build/SHA256SUMS
+
+      - name: Upload release bundle
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: release-${{ needs.plan.outputs.release_tag }}
+          path: |
+            build/linux-aggressive-kernel-*.deb
+            build/linux-aggressive-kernel-*.rpm
+            build/manifest.json
+            build/SHA256SUMS
+          if-no-files-found: error
+
+      - name: Publish release
+        run: |
+          set -euo pipefail
+          cat > build/release-notes.md <<EOF
+          Linux Aggressive Kernel ${UPSTREAM_KERNEL_VERSION} for amd64/x86_64 and arm64/aarch64.
+
+          - Stable Linux source: v${UPSTREAM_KERNEL_VERSION} from kernel.org, signature verified
+          - Packages: DEB and RPM
+          - Congestion control: BBRv1 with bounded Pixie ACK/loss compensation (${BUILD_SHA256:0:12})
+          - Maximum pacing/cwnd compensation: 1.5x
+          - Default qdisc: fq
+          - Kernel release suffix: -aggressive
+          EOF
+
+          assets=(build/linux-aggressive-kernel-*.deb build/linux-aggressive-kernel-*.rpm build/manifest.json build/SHA256SUMS)
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber
+            gh release edit "$RELEASE_TAG" --title "Linux Aggressive Kernel ${UPSTREAM_KERNEL_VERSION}" --notes-file build/release-notes.md --latest
+          else
+            gh release create "$RELEASE_TAG" "${assets[@]}" --title "Linux Aggressive Kernel ${UPSTREAM_KERNEL_VERSION}" --notes-file build/release-notes.md --latest
+          fi
