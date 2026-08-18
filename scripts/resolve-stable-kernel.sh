@@ -14,12 +14,14 @@ json="$(curl --fail --silent --show-error --location "$releases_url")"
 python3 -c '
 import json, re, sys
 payload = json.load(sys.stdin)
+stable_version = re.compile(r"[0-9]+\.[0-9]+(?:\.[0-9]+)?")
 version = str(payload.get("latest_stable", {}).get("version", ""))
-if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
+if not stable_version.fullmatch(version):
     stable = [r.get("version", "") for r in payload.get("releases", []) if r.get("moniker") == "stable"]
     version = stable[0] if stable else ""
-if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
+if not stable_version.fullmatch(version):
     raise SystemExit("No valid latest stable kernel version found")
+major, minor, *_ = version.split(".")
 print(f"UPSTREAM_KERNEL_VERSION={version}")
-print(f"KERNEL_SERIES={version.rsplit(chr(46), 1)[0]}")
+print(f"KERNEL_SERIES={major}.{minor}")
 ' <<< "$json"

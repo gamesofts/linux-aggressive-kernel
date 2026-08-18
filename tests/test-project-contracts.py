@@ -91,6 +91,8 @@ assert '| grep -q' not in installer
 # not by distro-specific filename or package-name assumptions.
 assert '-name "linux-image-${kernel_release}_*.deb"' not in workflow
 assert "== kernel" not in workflow
+assert 'kernel_release="$(make -s -C build/linux kernelrelease)"' in workflow
+assert 'kernel_release="${UPSTREAM_KERNEL_VERSION}${LOCALVERSION}"' not in workflow
 
 assert 'KERNEL_REPO="${KERNEL_REPO:-gamesofts/linux-aggressive-kernel}"' in installer
 assert 'readonly SYSCTL_FILE="/etc/sysctl.d/99-sysctl.conf"' in installer
@@ -101,7 +103,9 @@ assert "rpm -qp" in installer
 assert "remove_old_deb_kernels" in installer
 assert "remove_old_rpm_kernels" in installer
 assert '(manifest.get("schema"), manifest.get("profile")) != (2, "linux-aggressive-bbr-v1")' in installer
-assert 'kernel_release != f"{upstream_version}-aggressive"' in installer
+assert 'if not re.fullmatch(r"[0-9]+\\.[0-9]+(?:\\.[0-9]+)?", upstream_version):' in installer
+assert 'f"{upstream_version}.0" if upstream_version.count(".") == 1 else upstream_version' in installer
+assert "if kernel_release != expected_kernel_release:" in installer
 
 sysctl_match = re.search(
     r"cat > \"\$SYSCTL_FILE\" <<'SYSCTL'\n(.*?)\nSYSCTL",
