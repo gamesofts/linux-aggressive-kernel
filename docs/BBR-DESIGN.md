@@ -9,6 +9,8 @@ The controller separates two regimes:
 - **rate-independent erasure**: loss that persists below the bottleneck and should not cause the sender to give up usable capacity;
 - **overload / congestion loss**: loss above the trusted erasure floor, especially when accompanied by RTT inflation, which must not be amplified.
 
+The primary objective is useful throughput on difficult long-haul links. Safety logic exists to avoid self-inflicted overload, but it must not permanently trap a long-lived flow at a stale low erasure floor.
+
 The congestion-control name remains `bbr`, fq pacing remains the expected qdisc, and the maximum Pixie compensation remains 1.5x.
 
 ## Core model
@@ -66,7 +68,7 @@ This is safe because congestion cannot explain why the low quantile became clean
 
 ### Upward update
 
-A higher candidate is important for throughput: if the physical path's non-congestive loss rises from, for example, 10% to 20%, keeping the old floor would cause BBR to under-send indefinitely.
+A higher candidate is essential for throughput: if the physical path's non-congestive loss rises from, for example, 10% to 20%, keeping the old floor would cause BBR to under-send indefinitely.
 
 However, blindly moving the floor upward would recreate the dangerous positive-feedback loop:
 
@@ -240,4 +242,4 @@ Expected behavior:
 - strong excess loss or RTT inflation: temporarily falls back to native BBR recovery;
 - idle restart: discards stale path assumptions and learns again.
 
-The 1.5x cap remains intentionally bounded. Within that cap, the design now favors recovering useful throughput after a real increase in the path's erasure floor rather than leaving a long-lived connection permanently under-compensated.
+The 1.5x cap remains intentionally bounded. Within that cap, the design favors recovering useful throughput after a real increase in the path's erasure floor rather than leaving a long-lived connection permanently under-compensated.
