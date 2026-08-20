@@ -101,7 +101,7 @@ new_state = '''\tu32     mode:3,\t\t     /* current bbr_mode in state machine */
 \t\tpixie_round_count:4, /* valid completed feedback rounds */
 \t\tpixie_floor:8,       /* trusted erasure floor, 0..254 */
 \t\tpixie_overload_rounds:3, /* native recovery hold-down */
-\t\tunused:3;
+\t\tpixie_raise_rounds:3; /* low-pressure evidence for floor rise */
 \tu32\tpixie_rounds[2];  /* eight quantized RTT loss samples */
 \tu32\tpixie_round_acked;   /* ACKed packets in current round */
 \tu32\tpixie_round_lost;    /* lost packets in current round */
@@ -132,6 +132,7 @@ static u32 bbr_u32_add_sat(u32 value, u32 delta)
 #define BBR_PIXIE_MIN_FLOOR_RTTS 4
 #define BBR_PIXIE_LOSS_SCALE 254
 #define BBR_PIXIE_OVERLOAD_HOLD_RTTS 3
+#define BBR_PIXIE_RAISE_CONFIRM_RTTS 2
 #define BBR_PIXIE_MODERATE_EXCESS 8
 #define BBR_PIXIE_SEVERE_EXCESS 20
 
@@ -235,6 +236,16 @@ static bool bbr_pixie_queue_inflated(const struct sock *sk,
 \treturn (u64)rs->rtt_us * 4 > (u64)bbr->min_rtt_us * 5;
 }
 
+static bool bbr_pixie_low_pressure(const struct sock *sk,
+\t\t\t\t    const struct rate_sample *rs)
+{
+\tconst struct bbr *bbr = inet_csk_ca(sk);
+
+\treturn bbr->mode != BBR_STARTUP &&
+\t       bbr->pacing_gain <= BBR_UNIT &&
+\t       !bbr_pixie_queue_inflated(sk, rs);
+}
+
 static bool bbr_pixie_overloaded(const struct sock *sk,
 \t\t\t\t const struct rate_sample *rs, u8 recent_loss)
 {
@@ -263,6 +274,7 @@ static void bbr_reset_pixie_feedback(struct sock *sk)
 \tbbr->pixie_round_count = 0;
 \tbbr->pixie_floor = 0;
 \tbbr->pixie_overload_rounds = 0;
+\tbbr->pixie_raise_rounds = 0;
 \tbbr->pixie_round_acked = 0;
 \tbbr->pixie_round_lost = 0;
 }
@@ -273,29 +285,66 @@ static void bbr_pixie_update_floor(struct sock *sk,
 \tstruct bbr *bbr = inet_csk_ca(sk);
 \tu8 candidate;
 
-\tif (!bbr_pixie_floor_candidate(bbr, &candidate))
+\tif (!bbr_pixie_floor_candidate(bbr, &candidate)) {
+\t\tbbr->pixie_raise_rounds = 0;
 \t\treturn;
+\t}
 
 \tif (!bbr->pixie_active) {
 \t\t/* Do not learn a floor while STARTUP may itself be filling a queue.
 \t\t * Also reject a candidate sampled with obvious queue inflation.
 \t\t */
-\t\tif (candidate && bbr->mode != BBR_STARTUP &&
-\t\t    !bbr_pixie_queue_inflated(sk, rs)) {
+\t\tif (candidate && bbr_pixie_low_pressure(sk, rs)) {
 \t\t\tbbr->pixie_floor = candidate;
 \t\t\tbbr->pixie_active = 1;
 \t\t}
+\t\tbbr->pixie_raise_rounds = 0;
 \t\treturn;
 \t}
 
-\t/* The trusted floor is a lower envelope for the lifetime of this active
-\t * flow. Congestion may raise observed loss, but it must never raise the
-\t * amount we compensate. A genuine path change is relearned after idle reset.
+\t/* A lower robust candidate is immediately safe: congestion cannot explain
+\t * why a low quantile fell. Move down quickly so stale history does not
+\t * over-compensate a path that became cleaner.
 \t */
 \tif (candidate < bbr->pixie_floor) {
 \t\tbbr->pixie_floor = candidate;
+\t\tbbr->pixie_raise_rounds = 0;
 \t\tif (!candidate)
 \t\t\tbbr->pixie_active = 0;
+\t\treturn;
+\t}
+
+\tif (candidate == bbr->pixie_floor) {
+\t\tbbr->pixie_raise_rounds = 0;
+\t\treturn;
+\t}
+
+\t/* Throughput-oriented upward adaptation. A higher lower-quartile candidate
+\t * can be a genuine increase in rate-independent erasure, but can also be
+\t * persistent congestion. Count it only in a low-pressure BBR round: no
+\t * STARTUP, pacing at or below the delivered-bandwidth estimate, and no RTT
+\t * inflation. Two consecutive qualifying RTTs are enough because the
+\t * candidate itself already requires a robust multi-RTT lower quantile.
+\t *
+\t * Confirmation is allowed while overload hold-down is active. That is
+\t * intentional: native BBR recovery is the rate perturbation. If loss stays
+\t * high after the sender has backed off and the queue is not inflated, the
+\t * evidence favors a higher erasure floor rather than congestion.
+\t */
+\tif (!bbr_pixie_low_pressure(sk, rs)) {
+\t\tbbr->pixie_raise_rounds = 0;
+\t\treturn;
+\t}
+\tif (bbr->pixie_raise_rounds < BBR_PIXIE_RAISE_CONFIRM_RTTS)
+\t\tbbr->pixie_raise_rounds++;
+\tif (bbr->pixie_raise_rounds >= BBR_PIXIE_RAISE_CONFIRM_RTTS) {
+\t\tbbr->pixie_floor = candidate;
+\t\tbbr->pixie_raise_rounds = 0;
+\t\t/* The overload was measured against a stale lower floor. Once the
+\t\t * higher floor survives low-pressure confirmation, resume compensation
+\t\t * immediately instead of sacrificing several more WAN RTTs.
+\t\t */
+\t\tbbr->pixie_overload_rounds = 0;
 \t}
 }
 
@@ -339,8 +388,8 @@ static bool bbr_pixie_should_mask_loss(const struct sock *sk)
  *   wire_rate = delivered_rate / (1 - erasure_floor)
  *
  * The floor is quantized to 0..254 and the multiplier remains capped at 1.5x.
- * Excess loss never raises the floor; overload temporarily returns to native
- * BBR loss recovery instead of feeding a positive feedback loop.
+ * Excess loss enters native BBR recovery, while persistent higher loss that
+ * survives low-pressure confirmation can raise the trusted floor again.
  */
 static u32 bbr_pixie_gain(const struct sock *sk)
 {
@@ -634,6 +683,7 @@ source = replace_once(
 \t\tbbr->full_bw = 0;
 \t\tbbr->round_start = 1;\t/* treat RTO like end of a round */
 \t\tbbr->pixie_overload_rounds = BBR_PIXIE_OVERLOAD_HOLD_RTTS;
+\t\tbbr->pixie_raise_rounds = 0;
 \t}
 ''',
     "BBRv1 loss-state policer hook",
@@ -669,11 +719,14 @@ for required in [
     "BBR_PIXIE_MAX_RTTS",
     "BBR_PIXIE_MIN_SAMPLES",
     "BBR_PIXIE_MIN_FLOOR_RTTS",
+    "BBR_PIXIE_RAISE_CONFIRM_RTTS",
     "bbr_pixie_floor_candidate",
+    "bbr_pixie_low_pressure",
     "bbr_pixie_should_mask_loss",
     "bbr_pixie_overloaded",
     "bbr->pixie_floor",
     "bbr->pixie_overload_rounds",
+    "bbr->pixie_raise_rounds",
     "min(bbr_u32_add_sat(cwnd, acked), target_cwnd)",
 ]:
     if source.count(required) < 1:
@@ -699,7 +752,9 @@ if provenance_path:
         "BBR_PIXIE_MIN_FLOOR_RTTS=4\n"
         "BBR_PIXIE_MIN_SAMPLES=32\n"
         "BBR_PIXIE_FLOOR_ESTIMATOR=median_then_lower_half_median\n"
-        "BBR_PIXIE_FLOOR_UPDATE=lower_envelope_until_idle_reset\n"
+        "BBR_PIXIE_FLOOR_UPDATE=fast_down_confirmed_up\n"
+        "BBR_PIXIE_FLOOR_RAISE_CONFIRM_RTTS=2\n"
+        "BBR_PIXIE_FLOOR_RAISE_GATE=pacing_le_1x_no_rtt_inflation\n"
         "BBR_PIXIE_OVERLOAD_HOLD_RTTS=3\n"
         "BBR_PIXIE_RTT_INFLATION_PERCENT=125\n"
         "BBR_PIXIE_MAX_GAIN_PERCENT=150\n"
@@ -715,6 +770,6 @@ if provenance_path:
 
 print(
     "Applied erasure-aware BBRv1 Pixie compensation: 8-RTT robust floor, "
-    "lower-envelope trust, excess-loss/RTT overload detection, native BBR "
-    "recovery hold-down, 1.5x gain cap, idle reset, and safe cwnd arithmetic."
+    "fast-down/confirmed-up adaptation, excess-loss/RTT overload detection, "
+    "native BBR recovery hold-down, 1.5x gain cap, idle reset, and safe cwnd arithmetic."
 )
