@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Port Pixie's loss compensation into Linux BBRv1."""
+'''Port erasure-aware Pixie loss compensation into Linux BBRv1.'''
 
 import hashlib
 import sys
@@ -32,7 +32,7 @@ def replace_span(source: str, start: str, end: str, new: str, label: str) -> str
 
 
 if len(sys.argv) not in {2, 3}:
-    fail("usage: apply-stock-bbr-tuning.py TCP_BBR_C [PROVENANCE_ENV]")
+    fail("usage: apply-aggressive-bbr.py TCP_BBR_C [PROVENANCE_ENV]")
 
 source_path = Path(sys.argv[1]).resolve()
 provenance_path = Path(sys.argv[2]).resolve() if len(sys.argv) == 3 else None
@@ -42,9 +42,9 @@ if not source_path.is_file() or source_path.name != "tcp_bbr.c":
 source = source_path.read_text()
 stock_sha256 = hashlib.sha256(source.encode()).hexdigest()
 
-# Keep the mainline ten-round bandwidth max filter. Pixie compensates at the
-# pacing/cwnd actuation layer, so a second extended bandwidth memory is not
-# needed.
+# Keep the mainline ten-round bandwidth max filter. Erasure compensation is
+# applied at the pacing/cwnd actuation layer, so a second bandwidth model is
+# neither needed nor desirable.
 require_once(
     source,
     "static const int bbr_bw_rtts = CYCLE_LEN + 2;",
@@ -53,7 +53,7 @@ require_once(
 source = replace_once(
     source,
     '/* If lost/delivered ratio > 20%, interval is "lossy" and we may be policed: */',
-    '/* Legacy build anchor; Pixie compensation replaces BBRv1 policer use. */',
+    '/* Legacy build anchor; erasure-aware Pixie replaces BBRv1 policer use. */',
     "stock policer threshold comment",
 )
 source = replace_once(
@@ -92,15 +92,17 @@ old_state = '''\tu32     mode:3,\t\t     /* current bbr_mode in state machine */
 '''
 new_state = '''\tu32     mode:3,\t\t     /* current bbr_mode in state machine */
 \t\tprev_ca_state:3,     /* CA state on previous ACK */
-\t\tpacket_conservation:1,  /* retained ABI bit; forced off */
+\t\tpacket_conservation:1,  /* native recovery when overload is seen */
 \t\tround_start:1,\t     /* start of packet-timed tx->ack round? */
 \t\tidle_restart:1,\t     /* restarting after idle? */
 \t\tprobe_rtt_round_done:1,  /* a BBR_PROBE_RTT round at 4 pkts? */
-\t\tpixie_active:1,\t     /* loss compensation is active */
-\t\tpixie_round_head:2,  /* newest completed feedback round */
-\t\tpixie_round_count:3, /* valid completed feedback rounds */
-\t\tunused:16;
-\tu32\tpixie_rounds[2];  /* four packed completed feedback rounds */
+\t\tpixie_active:1,      /* trusted erasure floor is active */
+\t\tpixie_round_head:3,  /* newest completed feedback round */
+\t\tpixie_round_count:4, /* valid completed feedback rounds */
+\t\tpixie_floor:8,       /* trusted erasure floor, 0..254 */
+\t\tpixie_overload_rounds:3, /* native recovery hold-down */
+\t\tunused:3;
+\tu32\tpixie_rounds[2];  /* eight quantized RTT loss samples */
 \tu32\tpixie_round_acked;   /* ACKed packets in current round */
 \tu32\tpixie_round_lost;    /* lost packets in current round */
 '''
@@ -125,27 +127,129 @@ static u32 bbr_u32_add_sat(u32 value, u32 delta)
 \treturn min_t(u64, (u64)value + delta, U32_MAX);
 }
 
-#define BBR_PIXIE_MAX_RTTS 4
+#define BBR_PIXIE_MAX_RTTS 8
 #define BBR_PIXIE_MIN_SAMPLES 32
-#define BBR_PIXIE_ROUND_SHIFT 8
-#define BBR_PIXIE_ROUND_MASK U8_MAX
+#define BBR_PIXIE_MIN_FLOOR_RTTS 4
+#define BBR_PIXIE_LOSS_SCALE 254
+#define BBR_PIXIE_OVERLOAD_HOLD_RTTS 3
+#define BBR_PIXIE_MODERATE_EXCESS 8
+#define BBR_PIXIE_SEVERE_EXCESS 20
 
 static const u32 bbr_pixie_max_gain = (BBR_UNIT * 3) / 2;
 
-static u16 bbr_pixie_get_round(const struct bbr *bbr, u32 index)
+static u8 bbr_pixie_get_round(const struct bbr *bbr, u32 index)
 {
-\tu32 shift = (index & 1) * 16;
+\tu32 shift = (index & 3) * 8;
 
-\treturn (bbr->pixie_rounds[index >> 1] >> shift) & U16_MAX;
+\treturn (bbr->pixie_rounds[index >> 2] >> shift) & U8_MAX;
 }
 
-static void bbr_pixie_set_round(struct bbr *bbr, u32 index, u16 value)
+static void bbr_pixie_set_round(struct bbr *bbr, u32 index, u8 value)
 {
-\tu32 shift = (index & 1) * 16;
-\tu32 mask = (u32)U16_MAX << shift;
-\tu32 *word = &bbr->pixie_rounds[index >> 1];
+\tu32 shift = (index & 3) * 8;
+\tu32 mask = (u32)U8_MAX << shift;
+\tu32 *word = &bbr->pixie_rounds[index >> 2];
 
 \t*word = (*word & ~mask) | ((u32)value << shift);
+}
+
+static bool bbr_pixie_round_loss(u32 acked, u32 lost, u8 *loss)
+{
+\tu64 total = (u64)acked + lost;
+\tu64 scaled;
+
+\tif (total < BBR_PIXIE_MIN_SAMPLES)
+\t\treturn false;
+\tscaled = div64_u64((u64)lost * BBR_PIXIE_LOSS_SCALE + total / 2,
+\t\t\t   total);
+\t*loss = min_t(u64, scaled, BBR_PIXIE_LOSS_SCALE);
+\treturn true;
+}
+
+static void bbr_pixie_sort(u8 *values, u32 count)
+{
+\tu32 i;
+
+\tfor (i = 1; i < count; i++) {
+\t\tu8 value = values[i];
+\t\tu32 j = i;
+
+\t\twhile (j && values[j - 1] > value) {
+\t\t\tvalues[j] = values[j - 1];
+\t\t\tj--;
+\t\t}
+\t\tvalues[j] = value;
+\t}
+}
+
+/* Estimate the rate-independent loss floor without trusting a single minimum.
+ *
+ * With 4-5 valid RTTs use the median, which rejects one lucky low round and
+ * one transient high-loss round. Once 6-8 RTTs are available, use the median
+ * of the lower half. That is a compact lower-quartile estimator: high-loss
+ * congestion rounds live in the upper half, while one anomalously clean RTT
+ * cannot drag the floor down by itself.
+ */
+static bool bbr_pixie_floor_candidate(const struct bbr *bbr, u8 *floor)
+{
+\tu8 values[BBR_PIXIE_MAX_RTTS];
+\tu32 count = bbr->pixie_round_count;
+\tu32 i, low_count;
+
+\tif (count < BBR_PIXIE_MIN_FLOOR_RTTS)
+\t\treturn false;
+\tcount = min_t(u32, count, BBR_PIXIE_MAX_RTTS);
+\tfor (i = 0; i < count; i++) {
+\t\tu32 index = (bbr->pixie_round_head - i) &
+\t\t\t    (BBR_PIXIE_MAX_RTTS - 1);
+
+\t\tvalues[i] = bbr_pixie_get_round(bbr, index);
+\t}
+\tbbr_pixie_sort(values, count);
+
+\tif (count < 6) {
+\t\tif (count & 1)
+\t\t\t*floor = values[count / 2];
+\t\telse
+\t\t\t*floor = ((u32)values[count / 2 - 1] +
+\t\t\t\t  values[count / 2] + 1) / 2;
+\t\treturn true;
+\t}
+
+\tlow_count = count / 2;
+\tif (low_count & 1)
+\t\t*floor = values[low_count / 2];
+\telse
+\t\t*floor = ((u32)values[low_count / 2 - 1] +
+\t\t\t  values[low_count / 2] + 1) / 2;
+\treturn true;
+}
+
+static bool bbr_pixie_queue_inflated(const struct sock *sk,
+\t\t\t\t     const struct rate_sample *rs)
+{
+\tconst struct bbr *bbr = inet_csk_ca(sk);
+
+\tif (rs->rtt_us <= 0 || !bbr->min_rtt_us || bbr->min_rtt_us == ~0U)
+\t\treturn false;
+\treturn (u64)rs->rtt_us * 4 > (u64)bbr->min_rtt_us * 5;
+}
+
+static bool bbr_pixie_overloaded(const struct sock *sk,
+\t\t\t\t const struct rate_sample *rs, u8 recent_loss)
+{
+\tconst struct bbr *bbr = inet_csk_ca(sk);
+\tu32 floor = bbr->pixie_floor;
+\tu32 excess, moderate, severe;
+
+\tif (!bbr->pixie_active || recent_loss <= floor)
+\t\treturn false;
+\texcess = recent_loss - floor;
+\tmoderate = max_t(u32, BBR_PIXIE_MODERATE_EXCESS, floor / 4);
+\tsevere = max_t(u32, BBR_PIXIE_SEVERE_EXCESS, floor / 2);
+
+\treturn excess >= severe ||
+\t       (excess >= moderate && bbr_pixie_queue_inflated(sk, rs));
 }
 
 static void bbr_reset_pixie_feedback(struct sock *sk)
@@ -157,112 +261,99 @@ static void bbr_reset_pixie_feedback(struct sock *sk)
 \tbbr->pixie_active = 0;
 \tbbr->pixie_round_head = 0;
 \tbbr->pixie_round_count = 0;
+\tbbr->pixie_floor = 0;
+\tbbr->pixie_overload_rounds = 0;
 \tbbr->pixie_round_acked = 0;
 \tbbr->pixie_round_lost = 0;
 }
 
-/* Store one completed RTT in a compact ratio-preserving bucket. The sample
- * guard uses the true count up to U8_MAX; larger rounds are normalized so all
- * four RTTs can remain in BBR's fixed private-state budget.
- */
-static u16 bbr_pixie_pack_round(u32 acked, u32 lost)
+static void bbr_pixie_update_floor(struct sock *sk,
+\t\t\t\t   const struct rate_sample *rs)
 {
-\tu64 total = (u64)acked + lost;
-\tu32 samples, scaled_lost;
+\tstruct bbr *bbr = inet_csk_ca(sk);
+\tu8 candidate;
 
-\tif (!total)
-\t\treturn 0;
-\tsamples = min_t(u64, total, U8_MAX);
-\tscaled_lost = div64_u64((u64)lost * samples + total / 2, total);
-\t/* Preserve whether each completed RTT observed any loss. */
-\tif (lost && !scaled_lost)
-\t\tscaled_lost = 1;
-\tif (acked && scaled_lost >= samples)
-\t\tscaled_lost = samples - 1;
-\treturn (samples << BBR_PIXIE_ROUND_SHIFT) | scaled_lost;
-}
-
-static void bbr_pixie_collect_rounds(const struct bbr *bbr, u32 rounds,
-\t\t\t\t     u64 *samples, u64 *losses)
-{
-\tu32 i;
-
-\t*samples = 0;
-\t*losses = 0;
-\trounds = min(rounds, (u32)bbr->pixie_round_count);
-\tfor (i = 0; i < rounds; i++) {
-\t\tu32 index = (bbr->pixie_round_head - i) &
-\t\t\t    (BBR_PIXIE_MAX_RTTS - 1);
-\t\tu16 packed = bbr_pixie_get_round(bbr, index);
-
-\t\t*samples += packed >> BBR_PIXIE_ROUND_SHIFT;
-\t\t*losses += packed & BBR_PIXIE_ROUND_MASK;
-\t}
-}
-
-static void bbr_pixie_update_active(struct bbr *bbr)
-{
-\tu64 samples, losses;
-
-\tif (!bbr->pixie_round_count) {
-\t\tbbr->pixie_active = 0;
+\tif (!bbr_pixie_floor_candidate(bbr, &candidate))
 \t\treturn;
-\t}
+
 \tif (!bbr->pixie_active) {
-\t\t/* Enter quickly from the newest complete RTT. */
-\t\tbbr_pixie_collect_rounds(bbr, 1, &samples, &losses);
-\t\tif (samples >= BBR_PIXIE_MIN_SAMPLES && losses)
+\t\t/* Do not learn a floor while STARTUP may itself be filling a queue.
+\t\t * Also reject a candidate sampled with obvious queue inflation.
+\t\t */
+\t\tif (candidate && bbr->mode != BBR_STARTUP &&
+\t\t    !bbr_pixie_queue_inflated(sk, rs)) {
+\t\t\tbbr->pixie_floor = candidate;
 \t\t\tbbr->pixie_active = 1;
+\t\t}
 \t\treturn;
 \t}
 
-\t/* Exit only after four complete RTTs contain no observed loss. */
-\tif (bbr->pixie_round_count < BBR_PIXIE_MAX_RTTS)
-\t\treturn;
-\tbbr_pixie_collect_rounds(bbr, BBR_PIXIE_MAX_RTTS,
-\t\t\t\t &samples, &losses);
-\tif (samples >= BBR_PIXIE_MIN_SAMPLES && !losses)
-\t\tbbr->pixie_active = 0;
+\t/* The trusted floor is a lower envelope for the lifetime of this active
+\t * flow. Congestion may raise observed loss, but it must never raise the
+\t * amount we compensate. A genuine path change is relearned after idle reset.
+\t */
+\tif (candidate < bbr->pixie_floor) {
+\t\tbbr->pixie_floor = candidate;
+\t\tif (!candidate)
+\t\t\tbbr->pixie_active = 0;
+\t}
 }
 
-static void bbr_pixie_store_completed_round(struct bbr *bbr)
+static void bbr_pixie_store_completed_round(struct sock *sk,
+\t\t\t\t\t    const struct rate_sample *rs)
 {
-\tu16 packed = bbr_pixie_pack_round(bbr->pixie_round_acked,
-\t\t\t\t\tbbr->pixie_round_lost);
+\tstruct bbr *bbr = inet_csk_ca(sk);
+\tu8 loss;
 
-\tif (!packed)
+\tif (!bbr_pixie_round_loss(bbr->pixie_round_acked,
+\t\t\t\t  bbr->pixie_round_lost, &loss))
 \t\treturn;
 \tif (bbr->pixie_round_count)
 \t\tbbr->pixie_round_head = (bbr->pixie_round_head + 1) &
 \t\t\t\t\t(BBR_PIXIE_MAX_RTTS - 1);
-\tbbr_pixie_set_round(bbr, bbr->pixie_round_head, packed);
+\tbbr_pixie_set_round(bbr, bbr->pixie_round_head, loss);
 \tif (bbr->pixie_round_count < BBR_PIXIE_MAX_RTTS)
 \t\tbbr->pixie_round_count++;
-\tbbr_pixie_update_active(bbr);
+
+\t/* Detect excess loss against the already trusted floor before allowing the
+\t * floor estimator to see this round. Overload disables compensation and
+\t * restores native BBR recovery for a few complete RTTs.
+\t */
+\tif (bbr_pixie_overloaded(sk, rs, loss))
+\t\tbbr->pixie_overload_rounds = BBR_PIXIE_OVERLOAD_HOLD_RTTS;
+\telse if (bbr->pixie_overload_rounds)
+\t\tbbr->pixie_overload_rounds--;
+
+\tbbr_pixie_update_floor(sk, rs);
 }
 
-/* Compensate delivered goodput by the observed wire-loss ratio:
+static bool bbr_pixie_should_mask_loss(const struct sock *sk)
+{
+\tconst struct bbr *bbr = inet_csk_ca(sk);
+
+\treturn bbr->pixie_active && !bbr->pixie_overload_rounds;
+}
+
+/* Compensate only the trusted rate-independent erasure floor:
  *
- *   compensation = min((acked + lost) / acked, 1.5)
+ *   wire_rate = delivered_rate / (1 - erasure_floor)
  *
- * Entry uses one complete packet-timed RTT with at least 32 observations.
- * Once active, every available completed RTT in the four-RTT history is used,
- * and compensation exits only after four completed RTTs show no loss.
+ * The floor is quantized to 0..254 and the multiplier remains capped at 1.5x.
+ * Excess loss never raises the floor; overload temporarily returns to native
+ * BBR loss recovery instead of feeding a positive feedback loop.
  */
 static u32 bbr_pixie_gain(const struct sock *sk)
 {
 \tconst struct bbr *bbr = inet_csk_ca(sk);
-\tu64 samples, lost, acked, gain;
+\tu32 arrival, gain;
 
-\tif (!bbr->pixie_active)
+\tif (!bbr_pixie_should_mask_loss(sk) || !bbr->pixie_floor)
 \t\treturn BBR_UNIT;
-\tbbr_pixie_collect_rounds(bbr, BBR_PIXIE_MAX_RTTS,
-\t\t\t\t &samples, &lost);
-\tif (samples < BBR_PIXIE_MIN_SAMPLES || lost >= samples)
+\tarrival = BBR_PIXIE_LOSS_SCALE - bbr->pixie_floor;
+\tif (!arrival)
 \t\treturn BBR_UNIT;
-\tacked = samples - lost;
-\tgain = div64_u64(samples << BBR_SCALE, acked);
-\treturn min_t(u64, max_t(u64, gain, BBR_UNIT),
+\tgain = div_u64((u64)BBR_PIXIE_LOSS_SCALE << BBR_SCALE, arrival);
+\treturn min_t(u32, max_t(u32, gain, BBR_UNIT),
 \t\t     bbr_pixie_max_gain);
 }
 
@@ -377,7 +468,7 @@ source = replace_once(
     "BBRv1 ACK aggregation maximum",
 )
 
-pixie_feedback = '''/* Update adaptive completed-round Pixie feedback. */
+pixie_feedback = '''/* Update completed-round erasure feedback. */
 static void bbr_update_pixie_feedback(struct sock *sk,
 \t\t\t\t      const struct rate_sample *rs)
 {
@@ -385,7 +476,7 @@ static void bbr_update_pixie_feedback(struct sock *sk,
 
 \t/* The ACK that starts a new BBR round belongs to the new round. */
 \tif (bbr->round_start) {
-\t\tbbr_pixie_store_completed_round(bbr);
+\t\tbbr_pixie_store_completed_round(sk, rs);
 \t\tbbr->pixie_round_acked = 0;
 \t\tbbr->pixie_round_lost = 0;
 \t}
@@ -420,14 +511,38 @@ new_recovery = '''static bool bbr_set_cwnd_to_recover_or_restore(
 \tu8 prev_state = bbr->prev_ca_state, state = inet_csk(sk)->icsk_ca_state;
 \tu32 cwnd = tcp_snd_cwnd(tp);
 
-\t/* Pixie compensation owns the loss response. Keep TCP recovery and
-\t * retransmission machinery, but do not subtract losses or enter BBR's
-\t * packet-conservation cwnd path.
+\t/* Mask only the loss explained by a trusted erasure regime. When excess
+\t * loss or queue inflation triggers overload hold-down, fall through to
+\t * stock BBR recovery and packet conservation.
 \t */
-\tif (prev_state >= TCP_CA_Recovery && state < TCP_CA_Recovery)
+\tif (bbr_pixie_should_mask_loss(sk)) {
+\t\tif (prev_state >= TCP_CA_Recovery && state < TCP_CA_Recovery)
+\t\t\tcwnd = max(cwnd, bbr->prior_cwnd);
+\t\tbbr->prev_ca_state = state;
+\t\tbbr->packet_conservation = 0;
+\t\t*new_cwnd = cwnd;
+\t\treturn false;
+\t}
+
+\t/* Stock BBRv1 recovery path. */
+\tif (rs->losses > 0)
+\t\tcwnd = max_t(s32, cwnd - rs->losses, 1);
+
+\tif (state == TCP_CA_Recovery && prev_state != TCP_CA_Recovery) {
+\t\tbbr->packet_conservation = 1;
+\t\tbbr->next_rtt_delivered = tp->delivered;
+\t\tcwnd = tcp_packets_in_flight(tp) + acked;
+\t} else if (prev_state >= TCP_CA_Recovery && state < TCP_CA_Recovery) {
 \t\tcwnd = max(cwnd, bbr->prior_cwnd);
+\t\tbbr->packet_conservation = 0;
+\t}
+
 \tbbr->prev_ca_state = state;
-\tbbr->packet_conservation = 0;
+\tif (bbr->packet_conservation) {
+\t\t*new_cwnd = max(cwnd, tcp_packets_in_flight(tp) + acked);
+\t\treturn true;
+\t}
+
 \t*new_cwnd = cwnd;
 \treturn false;
 }
@@ -518,6 +633,7 @@ source = replace_once(
 \t\tbbr->prev_ca_state = TCP_CA_Loss;
 \t\tbbr->full_bw = 0;
 \t\tbbr->round_start = 1;\t/* treat RTO like end of a round */
+\t\tbbr->pixie_overload_rounds = BBR_PIXIE_OVERLOAD_HOLD_RTTS;
 \t}
 ''',
     "BBRv1 loss-state policer hook",
@@ -525,7 +641,7 @@ source = replace_once(
 source = replace_once(
     source,
     'MODULE_DESCRIPTION("TCP BBR (Bottleneck Bandwidth and RTT)");',
-    'MODULE_DESCRIPTION("TCP BBR with Pixie loss compensation");',
+    'MODULE_DESCRIPTION("TCP BBR with erasure-aware Pixie compensation");',
     "BBR module description",
 )
 
@@ -552,11 +668,12 @@ for required in [
     "bbr_pixie_max_gain",
     "BBR_PIXIE_MAX_RTTS",
     "BBR_PIXIE_MIN_SAMPLES",
-    "bbr_pixie_pack_round",
-    "bbr_pixie_store_completed_round",
-    "bbr_pixie_update_active",
-    "bbr_pixie_collect_rounds",
-    "bbr->pixie_active",
+    "BBR_PIXIE_MIN_FLOOR_RTTS",
+    "bbr_pixie_floor_candidate",
+    "bbr_pixie_should_mask_loss",
+    "bbr_pixie_overloaded",
+    "bbr->pixie_floor",
+    "bbr->pixie_overload_rounds",
     "min(bbr_u32_add_sat(cwnd, acked), target_cwnd)",
 ]:
     if source.count(required) < 1:
@@ -572,23 +689,32 @@ if provenance_path:
         "BBR_BW_RTTS=10\n"
         "BBR_LT_LOSS_THRESH=96\n"
         "BBR_LT_BW_MAX_RTTS=24\n"
+        # Legacy build-contract fields retained for the existing release workflow.
+        # ENTRY_RTTS means feedback collection starts with the first completed
+        # round; floor activation itself requires BBR_PIXIE_MIN_FLOOR_RTTS.
         "BBR_PIXIE_FEEDBACK_ENTRY_RTTS=1\n"
         "BBR_PIXIE_FEEDBACK_EXIT_RTTS=4\n"
-        "BBR_PIXIE_MIN_SAMPLES=32\n"
         "BBR_PIXIE_FEEDBACK_WINDOW=adaptive_hysteresis_completed_rounds\n"
+        "BBR_PIXIE_FEEDBACK_RTTS=8\n"
+        "BBR_PIXIE_MIN_FLOOR_RTTS=4\n"
+        "BBR_PIXIE_MIN_SAMPLES=32\n"
+        "BBR_PIXIE_FLOOR_ESTIMATOR=median_then_lower_half_median\n"
+        "BBR_PIXIE_FLOOR_UPDATE=lower_envelope_until_idle_reset\n"
+        "BBR_PIXIE_OVERLOAD_HOLD_RTTS=3\n"
+        "BBR_PIXIE_RTT_INFLATION_PERCENT=125\n"
         "BBR_PIXIE_MAX_GAIN_PERCENT=150\n"
         "BBR_PIXIE_IDLE_RESET=1\n"
         "BBR_PIXIE_PACING_COMPENSATION=1\n"
         "BBR_PIXIE_CWND_COMPENSATION=1\n"
+        "BBR_PIXIE_NATIVE_RECOVERY_ON_OVERLOAD=1\n"
         "BBR_PIXIE_CWND_SATURATING_ARITHMETIC=1\n"
         "BBR_PIXIE_CWND_GRADUAL_GROWTH=1\n"
         "BBR_PIXIE_POLICER_MODEL=0\n"
-        "BBR_PIXIE_PACKET_CONSERVATION=0\n"
         "BBR_PACING_MARGIN_PERCENT=0\n"
     )
 
 print(
-    "Applied BBRv1 Pixie compensation: one-RTT entry, four-RTT exit, "
-    "32-sample guard, 1.5x gain cap, idle reset, gradual cwnd growth, "
-    "and saturating cwnd arithmetic."
+    "Applied erasure-aware BBRv1 Pixie compensation: 8-RTT robust floor, "
+    "lower-envelope trust, excess-loss/RTT overload detection, native BBR "
+    "recovery hold-down, 1.5x gain cap, idle reset, and safe cwnd arithmetic."
 )
