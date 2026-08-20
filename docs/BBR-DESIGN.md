@@ -1,92 +1,186 @@
-# BBRv1 Pixie loss-compensation design
+# BBRv1 erasure-aware Pixie design
 
 ## Goal
 
-Linux Aggressive Kernel keeps BBRv1's delivery-bandwidth and min-RTT model while using a bounded loss multiplier to determine the wire rate and inflight budget required to preserve delivered goodput on lossy paths.
+Linux Aggressive Kernel keeps BBRv1's delivery-bandwidth and min-RTT model, but no longer assumes that every observed loss should be compensated equally.
 
-The congestion-control name remains `bbr`, and fq pacing remains the expected qdisc.
+The controller now separates two regimes:
 
-## Core formula
+- **rate-independent erasure**: loss that persists below the bottleneck and should not cause the sender to give up usable capacity;
+- **overload / congestion loss**: loss above the trusted erasure floor, especially when accompanied by RTT inflation, which must not be amplified.
 
-```text
-raw_loss_gain = (acked + lost) / acked
-loss_gain = min(raw_loss_gain, 1.5)
-pacing_rate = BBR_pacing_rate * loss_gain
-cwnd_target = BBR_cwnd_target * loss_gain
-```
+The congestion-control name remains `bbr`, fq pacing remains the expected qdisc, and the maximum Pixie compensation remains 1.5x.
 
-With `p = lost / (acked + lost)`, the uncapped multiplier is `1 / (1 - p)` whenever at least one packet has been ACKed. A window with no valid ACK feedback uses a gain of 1.0.
+## Core model
 
-The same 1.5 gain cap applies to pacing and compensated cwnd/inflight. It limits the requested wire rate and inflight budget to 150% of BBR's base output.
-
-## Adaptive feedback window
-
-The feedback controller uses completed packet-timed RTTs and deliberately has different entry and exit behavior.
-
-### Entry
-
-While compensation is inactive, only the newest completed RTT is examined. Compensation becomes active when that RTT contains at least 32 packet observations and at least one observed loss. This allows a real loss signal to affect the next round without waiting for a long history.
-
-### Maintenance
-
-Once active, the gain uses every available completed RTT in the most recent four-RTT history:
+BBR measures successfully delivered bandwidth. On an erasure channel, the wire rate needed to preserve that delivered rate is larger:
 
 ```text
-window_samples = sum(samples from up to 4 completed RTTs)
-window_lost = sum(losses from up to 4 completed RTTs)
-window_acked = window_samples - window_lost
+arrival_rate = 1 - erasure_floor
+wire_rate = delivered_rate / arrival_rate
 ```
 
-The 32-sample threshold is only an activation guard. Reaching it does not stop accumulation; all retained rounds continue to contribute to the active gain.
-
-### Exit
-
-Compensation does not exit after one clean RTT. It exits only when four completed RTTs are available and the complete four-RTT history contains no observed loss. This hysteresis makes entry fast while preventing short clean intervals from repeatedly disabling and re-enabling compensation.
-
-The fixed BBR private-state area stores four completed RTT buckets plus full current-round ACK/loss counters. Completed rounds are ratio-preserving normalized buckets so the four-RTT history fits without increasing `struct bbr` beyond `ICSK_CA_PRIV_SIZE`.
-
-## Idle restart
-
-When BBR detects an application-limited transmit restart, the completed-round history, current counters, and active state are cleared. New traffic starts with a gain of 1.0 and must satisfy the one-RTT entry rule again.
-
-## Bandwidth model
-
-The delivery-rate max filter uses `CYCLE_LEN + 2`. The bounded loss gain is not written into delivery-rate samples or the max filter. BBR continues to model successfully delivered bandwidth, while the multiplier determines additional wire traffic.
-
-## Pacing
+The same bounded multiplier is applied to pacing and BDP/cwnd:
 
 ```text
-base_rate = bbr_rate_bytes_per_sec(bw, pacing_gain)
-wire_rate = base_rate * loss_gain
-pacing_rate = min(wire_rate, sk_max_pacing_rate)
+gain = min(1 / (1 - erasure_floor), 1.5)
+pacing_rate = BBR_pacing_rate * gain
+cwnd_target = BBR_cwnd_target * gain
 ```
 
-The pacing margin is 0%, so the base output is not reduced before compensation.
+The erasure gain is never written back into BBR's delivery-rate max filter. BBR continues to estimate useful delivered bandwidth rather than the additional wire traffic required to survive loss.
 
-## Cwnd and inflight
+## Why the floor is not a simple minimum
 
-`bbr_bdp()` applies the same bounded multiplier to the BDP target. Cwnd growth remains ACK-paced:
+A rolling minimum is attractive because congestion can only push observed loss upward. It is also too sensitive to a single unusually clean RTT. One lucky sample can make a real 10-20% erasure path look almost clean and keep it under-compensated for the lifetime of the window.
+
+The v2 estimator therefore keeps **eight valid completed RTT loss ratios** in the same fixed private-state budget previously used by BBRv1's long-term policer fields.
+
+Each RTT must contain at least 32 ACKed+lost packets. The stored value is a one-byte quantized loss ratio on a 0..254 scale.
+
+The floor candidate is robust rather than a raw minimum:
+
+- with 4-5 valid RTTs, use the median;
+- with 6-8 valid RTTs, take the lower half of the sorted samples and use that half's median.
+
+For eight RTTs this is effectively a lower-quartile estimate built from the second and third-lowest observations. A single very low outlier cannot drag the result down, while high-loss congestion rounds naturally remain in the upper half and do not raise the baseline.
+
+Example:
 
 ```text
-cwnd = min(saturating_add(cwnd, acked), target_cwnd)
+RTT loss: 14 15 15 16 17 31 34 38 (%)
+sorted:   14 15 15 16 17 31 34 38
+lower half: 14 15 15 16
+floor candidate ~= 15%
 ```
 
-Before full bandwidth is reached, STARTUP growth also uses saturated addition. The final cwnd remains capped by `snd_cwnd_clamp`.
+## Trusted lower envelope
+
+Once a floor is established, it is deliberately asymmetric:
+
+- a lower robust candidate may reduce the trusted floor immediately;
+- a higher candidate never raises the trusted floor during the same active period.
+
+This prevents the dangerous loop:
+
+```text
+queue overload -> more loss -> higher estimated floor
+               -> more compensation -> still more overload
+```
+
+A genuine path change is relearned after BBR's application-limited idle restart, which clears the Pixie floor and feedback history.
+
+This is intentionally conservative. If the real non-congestive erasure rate suddenly rises during one continuously active TCP flow, the controller may temporarily under-compensate rather than risk misclassifying congestion as erasure.
+
+## Floor activation
+
+The controller does not compensate from the first lossy RTT.
+
+A trusted floor requires:
+
+1. at least four valid completed RTT samples;
+2. a non-zero robust floor candidate;
+3. BBR must no longer be in STARTUP;
+4. the current RTT sample must not show obvious queue inflation.
+
+Avoiding STARTUP is important because STARTUP deliberately probes aggressively and may itself create queue loss. Learning a permanent erasure baseline from that phase would be unsafe.
+
+## Overload detection
+
+After a trusted floor exists, each completed valid RTT is compared with it.
+
+```text
+excess_loss = recent_loss - trusted_floor
+```
+
+Two thresholds are used on the quantized 0..254 scale:
+
+```text
+moderate_excess = max(~3.1%, floor / 4)
+severe_excess   = max(~7.9%, floor / 2)
+```
+
+Overload is declared when either:
+
+- excess loss reaches the severe threshold; or
+- excess loss reaches the moderate threshold and sampled RTT exceeds 125% of BBR min-RTT.
+
+This deliberately treats large unexplained loss as suspicious even with a shallow queue where RTT inflation may be small.
+
+## Overload hold-down and native recovery
+
+When overload is detected, Pixie compensation is disabled for three valid completed RTTs.
+
+During this hold-down:
+
+- `bbr_pixie_gain()` returns 1.0;
+- pacing and cwnd are no longer erasure-boosted;
+- the stock BBRv1 loss recovery path is restored;
+- loss may reduce cwnd;
+- BBR packet conservation is allowed to operate.
+
+An RTO also immediately starts the overload hold-down.
+
+When the hold-down expires without renewed overload evidence, compensation resumes using the unchanged trusted floor.
+
+## Private-state budget
+
+The implementation does not increase the BBR private-state footprint beyond the space formerly occupied by the long-term policer state.
+
+The previous four u32 policer words are repurposed as:
+
+```text
+pixie_rounds[2]       8 x one-byte RTT loss samples
+pixie_round_acked     current RTT ACK count
+pixie_round_lost      current RTT loss count
+```
+
+Additional state fits in the existing 32-bit flag word:
+
+```text
+pixie_active             1 bit
+pixie_round_head         3 bits
+pixie_round_count        4 bits
+pixie_floor              8 bits
+pixie_overload_rounds    3 bits
+```
 
 ## Loss recovery
 
-TCP loss detection, SACK, RACK, TLP, RTO, retransmission queues, and recovery state remain active. The BBR loss-response path does not subtract newly marked losses from cwnd and does not enable BBR packet conservation. ACK/loss feedback continues to determine the bounded pacing and target-cwnd multiplier during recovery.
+TCP SACK/RACK/TLP/RTO and retransmission machinery remain untouched.
 
-## BBR modes
+Behavior differs by regime:
 
-The implementation retains STARTUP, DRAIN, ProbeBW, ProbeRTT, min-RTT measurement, ACK aggregation, TSO/GSO quantization, and fq/socket pacing limits. The BBRv1 long-term policer estimator is not used. `bbr_bw()` always returns the windowed delivery-bandwidth maximum.
+```text
+trusted erasure, no overload:
+    mask BBR's direct cwnd loss response
+    keep retransmission machinery
+    compensate pacing + cwnd from trusted floor
 
-## Source and build model
+overload / unknown regime:
+    no Pixie gain
+    use native BBRv1 cwnd loss response
+    use native packet conservation
+```
 
-The project tracks the latest kernel.org stable release and verifies the downloaded source against a kernel.org maintainer signature. `scripts/apply-aggressive-bbr.py` transforms only `net/ipv4/tcp_bbr.c` and rejects unexpected source layouts.
+This is the main safety change from the first Pixie version, which effectively let Pixie own the response to every observed loss.
 
-The kernel configuration starts from the upstream architecture defconfig and enables the networking, storage, filesystems and virtualization features needed by mainstream VPS/cloud environments. CI validates the transformation with GCC and Clang on amd64 and arm64, then builds and validates both DEB and RPM packages plus a signed-source provenance manifest.
+## BBR modes and bandwidth model
 
-## Network experiment matrix
+The implementation retains STARTUP, DRAIN, ProbeBW, ProbeRTT, min-RTT measurement, ACK aggregation, TSO/GSO quantization, fq/socket pacing limits, and the ten-round delivery-bandwidth max filter.
 
-Recommended tests cover RTTs of 20, 100, 250, and 600 ms; random and burst loss; forward, reverse, and bidirectional loss; capacity changes; post-bottleneck corruption; queue drops; policers; shallow queues; and competing BBR/CUBIC flows. Record delivered goodput, wire throughput, retransmitted bytes, RTO/TLP counts, p50/p95/p99 RTT, pacing rate, cwnd, delivery-bandwidth estimate, and recovery time after path changes.
+The BBRv1 long-term policer estimator is not used. `bbr_bw()` always returns the windowed delivered-bandwidth maximum.
+
+## Operational expectations
+
+The design is intended for high-latency links with a measurable rate-independent loss floor, such as difficult cross-border, mobile, wireless, satellite, or otherwise lossy long-haul paths.
+
+Expected behavior:
+
+- clean path: behaves close to ordinary BBRv1;
+- stable random loss: learns a floor after several completed RTTs and compensates it;
+- transient queue loss: does not raise the floor;
+- strong excess loss or RTT inflation: temporarily falls back to native BBR recovery;
+- idle restart: discards stale path assumptions and learns again.
+
+The 1.5x cap remains intentionally conservative. The current design favors avoiding self-inflicted overload over fully compensating extreme erasure rates.
