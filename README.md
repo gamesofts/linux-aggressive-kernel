@@ -26,14 +26,12 @@ BBR 的 delivered-bandwidth 模型仍然只记录成功交付的数据；补偿�
 - 每个 RTT 至少观察 32 个 ACKed+lost 包才有效；
 - 4-5 个有效 RTT 时使用中位数；
 - 6-8 个有效 RTT 时，对排序后的低半部分再取中位数，相当于稳健的低四分位基线；
-- floor 建立后，在同一次活跃传输中只允许向下修正，不允许因为后来 loss 变高而上调；
+- candidate 低于当前 trusted floor 时立即下调，避免路径变干净后继续过度补偿；
+- candidate 高于 trusted floor 时允许上调，但只在 BBR 非 STARTUP、`pacing_gain <= 1.0` 且 RTT 没有明显膨胀的完整 RTT 中累计证据；
+- 连续 2 个这样的低压力 RTT 都支持更高 candidate 后，直接把 trusted floor 提高到新的 robust candidate，并立即恢复按新 floor 补偿；
 - application-limited idle restart 会清空 floor 并重新学习路径。
 
-这样可以避免：
-
-```text
-拥塞 -> 丢包升高 -> floor 升高 -> 补偿更猛 -> 更拥塞
-```
+因此 floor 是 **fast-down / confirmed-up**，而不是永久只能下降。目标是在网络基础丢包恶化时仍能尽快提高 wire rate，同时避免把一次拥塞尖峰直接学进 floor。
 
 ## 拥塞保护
 
@@ -47,22 +45,26 @@ BBR 的 delivered-bandwidth 模型仍然只记录成功交付的数据；补偿�
 
 RTO 也会直接触发该保护。
 
+这里的 hold-down 同时充当一次主动“降压测试”：如果 sender 已经退让、`pacing_gain <= 1.0`、RTT 也没有排队膨胀，但 robust loss floor 仍持续更高，就把它视为基础 erasure 上升，而不是继续按拥塞处理。
+
 这意味着现在的原则是：
 
 ```text
 稳定随机丢包 -> 补偿
-超出基础丢包的异常 loss / 排队 -> 退让
+异常 excess loss / 排队 -> 先退让
+退让后 loss 仍稳定偏高且无排队 -> 提高 floor，恢复更强补偿
 ```
 
 ## 主要设计
 
 - **8 RTT 稳健 floor**：不用单个最小值，降低偶发低丢包样本的影响。
-- **lower-envelope trust**：可信 floor 在活跃期间不能被高 loss 抬升。
-- **STARTUP 防误判**：不在 BBR STARTUP 阶段建立 erasure floor。
+- **fast-down / confirmed-up**：floor 可以双向适应；上升需要低压力 RTT 连续确认。
+- **STARTUP 防误判**：不在 BBR STARTUP 阶段建立或上调 erasure floor。
+- **主动降压判别**：用 `pacing_gain <= 1.0` 且无 RTT inflation 的回合确认更高 loss 是否仍然存在。
 - **RTT + excess loss 过载判断**：既看额外丢包，也看排队延迟。
 - **原生 recovery 回退**：检测到 overload 后重新启用 BBRv1 loss recovery 和 packet conservation。
 - **速率与窗口协调调整**：pacing rate 和 cwnd/BDP 使用同一个补偿系数。
-- **1.5x 上限**：继续保留保守的最大线速补偿限制。
+- **1.5x 上限**：继续保留最大线速补偿限制。
 - **不污染带宽估计**：补偿不会写回 delivered-bandwidth max filter。
 
 ## 安装
