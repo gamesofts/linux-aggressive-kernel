@@ -2,13 +2,22 @@
 
 [![Build Linux Aggressive Kernel](https://github.com/gamesofts/linux-aggressive-kernel/actions/workflows/build-aggressive-kernel.yml/badge.svg)](https://github.com/gamesofts/linux-aggressive-kernel/actions/workflows/build-aggressive-kernel.yml)
 
-Linux Aggressive Kernel 为 amd64/x86_64 和 arm64/aarch64 主机构建实验性 Linux 内核，并将 [Pixie](https://github.com/marywangran/pixie) 的丢包补偿思路移植到 Linux BBRv1。
+Linux Aggressive Kernel 为 amd64/x86_64 和 arm64/aarch64 主机构建实验性 Linux 内核，并在 Linux BBRv1 上加入更激进但保持简单的带宽探测，以及 [Pixie](https://github.com/marywangran/pixie) 的丢包补偿思路。
 
-它主要面向高延迟、随机丢包明显的网络，例如跨境线路、移动网络、卫星网络和人工丢包测试环境。目标是在链路仍有可用容量时，通过适当增加实际发送量，减少丢包对有效下载或上传速度的影响。
+它主要面向高延迟、随机丢包明显或标准 BBR 探测偏保守的网络，例如跨境线路、移动网络、卫星网络和人工丢包测试环境。目标是在链路仍有可用容量时，更主动地寻找吞吐上限，并减少丢包对有效下载或上传速度的影响。
 
 ## 工作原理
 
-算法根据最近完整 RTT 的成功包和丢失包计算补偿，并同时调整发送速率和拥塞窗口目标：
+在保留 BBRv1 delivery-bandwidth 与 min-RTT 模型的前提下，项目只调整几个固定参数，不引入复杂的线路分类逻辑：
+
+```text
+STARTUP：带宽每轮还能增长 12.5% 就继续扩张；连续 4 RTT 达不到该增长才认为管道已满
+ProbeBW：1.50, 0.75, 1, 1, 1, 1, 1, 1
+```
+
+也就是说，稳态每 8 RTT 用一个 RTT 以 1.5 倍估计带宽强力探测，随后保持 BBRv1 原有的 0.75 倍 drain，再以 1.0 倍巡航 6 个 RTT。
+
+丢包补偿仍根据最近完整 RTT 的成功包和丢失包计算，并同时调整发送速率和拥塞窗口目标：
 
 ```text
 补偿系数 = min（（成功包 + 丢失包）/ 成功包，1.5）
@@ -25,7 +34,11 @@ Linux Aggressive Kernel 为 amd64/x86_64 和 arm64/aarch64 主机构建实验性
 
 ## 主要设计
 
-- **滞回式自适应窗口**：观测最近一个完整 RTT，至少观察到 32 个包且出现丢包，即启动补偿。启动后使用最多 4 个完整 RTT 的全部统计结果计算补偿，不会因为某一个 RTT 短暂恢复就立即退出。
+- **更激进的 STARTUP**：BBRv1 原本要求约 25% 的带宽增长才继续确认容量，本项目把门槛降到 12.5%，并将“无明显增长”确认延长到 4 RTT，让长 RTT 和抖动线路更不容易过早退出 STARTUP。
+
+- **固定 1.5 倍 ProbeBW 探测**：不根据 RTT、队列或丢包动态调档，只把 ProbeBW 的首个探测 RTT 从 1.25 倍提高到 1.5 倍；后续 0.75 倍 drain 和 6 个 1.0 倍巡航 RTT 保持不变。
+
+- **滞回式自适应丢包窗口**：观测最近一个完整 RTT，至少观察到 32 个包且出现丢包，即启动补偿。启动后使用最多 4 个完整 RTT 的全部统计结果计算补偿，不会因为某一个 RTT 短暂恢复就立即退出。
 
 - **正反馈自激控制**：补偿作用于 pacing rate 和 cwnd/inflight 目标，最高限制为 BBR 基础结果的 1.5 倍；补偿结果不会写回 delivered-bandwidth 估计或带宽 max filter，不会形成自激链路。
 

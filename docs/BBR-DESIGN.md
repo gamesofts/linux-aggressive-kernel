@@ -1,12 +1,28 @@
-# BBRv1 Pixie loss-compensation design
+# BBRv1 aggressive probing + Pixie loss-compensation design
 
 ## Goal
 
-Linux Aggressive Kernel keeps BBRv1's delivery-bandwidth and min-RTT model while using a bounded loss multiplier to determine the wire rate and inflight budget required to preserve delivered goodput on lossy paths.
+Linux Aggressive Kernel keeps BBRv1's delivery-bandwidth and min-RTT model, makes STARTUP and ProbeBW more aggressive with fixed constants, and uses a bounded loss multiplier to determine the wire rate and inflight budget required to preserve delivered goodput on lossy paths.
 
-The congestion-control name remains `bbr`, and fq pacing remains the expected qdisc.
+The design deliberately avoids dynamic path classification for bandwidth probing. The congestion-control name remains `bbr`, and fq pacing remains the expected qdisc.
 
-## Core formula
+## Aggressive probing
+
+The bandwidth-probing changes are intentionally simple:
+
+```text
+STARTUP growth threshold = 1.125
+STARTUP no-growth confirmation = 4 RTTs
+ProbeBW gains = 1.50, 0.75, 1, 1, 1, 1, 1, 1
+```
+
+Stock BBRv1 considers bandwidth growth significant only when the current maximum reaches about 1.25 times the previous full-bandwidth estimate, and declares the pipe full after three non-growing rounds. Linux Aggressive Kernel lowers that growth threshold to 1.125 and requires four non-growing rounds before leaving STARTUP.
+
+ProbeBW keeps the original eight-RTT cycle shape but changes only the first probe gain from 1.25 to 1.50. The following 0.75 drain RTT and six 1.0 cruise RTTs remain unchanged. The average gain over a complete cycle is therefore 1.03125.
+
+These probe gains affect the BBR actuation path but do not create a second bandwidth estimator. Successfully delivered traffic still determines BBR's delivery-bandwidth samples and max filter.
+
+## Core loss-compensation formula
 
 ```text
 raw_loss_gain = (acked + lost) / acked
@@ -51,7 +67,7 @@ When BBR detects an application-limited transmit restart, the completed-round hi
 
 ## Bandwidth model
 
-The delivery-rate max filter uses `CYCLE_LEN + 2`. The bounded loss gain is not written into delivery-rate samples or the max filter. BBR continues to model successfully delivered bandwidth, while the multiplier determines additional wire traffic.
+The delivery-rate max filter uses `CYCLE_LEN + 2`. Neither the fixed aggressive probe gain nor the bounded loss gain is written into delivery-rate samples or the max filter. BBR continues to model successfully delivered bandwidth, while the gains determine how aggressively that model is tested and how much extra wire traffic is used to compensate for loss.
 
 ## Pacing
 
@@ -61,11 +77,11 @@ wire_rate = base_rate * loss_gain
 pacing_rate = min(wire_rate, sk_max_pacing_rate)
 ```
 
-The pacing margin is 0%, so the base output is not reduced before compensation.
+During ProbeBW's first phase, `pacing_gain` is 1.5. During STARTUP the normal BBR high gain is retained. The pacing margin is 0%, so the base output is not reduced before compensation.
 
 ## Cwnd and inflight
 
-`bbr_bdp()` applies the same bounded multiplier to the BDP target. Cwnd growth remains ACK-paced:
+`bbr_bdp()` applies the same bounded loss multiplier to the BDP target. Cwnd growth remains ACK-paced:
 
 ```text
 cwnd = min(saturating_add(cwnd, acked), target_cwnd)
@@ -79,7 +95,7 @@ TCP loss detection, SACK, RACK, TLP, RTO, retransmission queues, and recovery st
 
 ## BBR modes
 
-The implementation retains STARTUP, DRAIN, ProbeBW, ProbeRTT, min-RTT measurement, ACK aggregation, TSO/GSO quantization, and fq/socket pacing limits. The BBRv1 long-term policer estimator is not used. `bbr_bw()` always returns the windowed delivery-bandwidth maximum.
+The implementation retains STARTUP, DRAIN, ProbeBW, ProbeRTT, min-RTT measurement, ACK aggregation, TSO/GSO quantization, and fq/socket pacing limits. STARTUP uses the 12.5% growth threshold with four-round confirmation, and ProbeBW uses the fixed `1.50, 0.75, 1, 1, 1, 1, 1, 1` gain cycle. The BBRv1 long-term policer estimator is not used. `bbr_bw()` always returns the windowed delivery-bandwidth maximum.
 
 ## Source and build model
 

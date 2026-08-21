@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Port Pixie's loss compensation into Linux BBRv1."""
+"""Port Pixie's loss compensation and simple aggressive probing into Linux BBRv1."""
 
 import hashlib
 import sys
@@ -73,6 +73,29 @@ source = replace_once(
     "static const int bbr_pacing_margin_percent = 1;",
     "static const int bbr_pacing_margin_percent = 0;",
     "stock pacing margin",
+)
+
+# Keep the probing policy deliberately simple and fixed. STARTUP considers a
+# 12.5% delivery-rate increase meaningful and waits four flat rounds before
+# declaring the pipe full. ProbeBW uses one 1.5x probe RTT followed by the
+# stock 0.75x drain RTT and six 1.0x cruise RTTs.
+source = replace_once(
+    source,
+    "static const u32 bbr_full_bw_thresh = BBR_UNIT * 5 / 4;",
+    "static const u32 bbr_full_bw_thresh = BBR_UNIT * 9 / 8;",
+    "BBRv1 STARTUP growth threshold",
+)
+source = replace_once(
+    source,
+    "static const u32 bbr_full_bw_cnt = 3;",
+    "static const u32 bbr_full_bw_cnt = 4;",
+    "BBRv1 STARTUP no-growth rounds",
+)
+source = replace_once(
+    source,
+    "\tBBR_UNIT * 5 / 4,\t/* probe for more available bw */",
+    "\tBBR_UNIT * 3 / 2,\t/* aggressively probe for more available bw */",
+    "BBRv1 ProbeBW probe gain",
 )
 
 old_state = '''\tu32     mode:3,\t\t     /* current bbr_mode in state machine */
@@ -525,7 +548,7 @@ source = replace_once(
 source = replace_once(
     source,
     'MODULE_DESCRIPTION("TCP BBR (Bottleneck Bandwidth and RTT)");',
-    'MODULE_DESCRIPTION("TCP BBR with Pixie loss compensation");',
+    'MODULE_DESCRIPTION("TCP BBR with aggressive probing and Pixie loss compensation");',
     "BBR module description",
 )
 
@@ -544,6 +567,9 @@ for forbidden in [
         fail(f"stale or unsafe BBRv1 state remains: {forbidden}")
 for required in [
     "static const int bbr_bw_rtts = CYCLE_LEN + 2;",
+    "static const u32 bbr_full_bw_thresh = BBR_UNIT * 9 / 8;",
+    "static const u32 bbr_full_bw_cnt = 4;",
+    "BBR_UNIT * 3 / 2,\t/* aggressively probe for more available bw */",
     "bbr_pixie_gain",
     "bbr_apply_pixie_gain",
     "bbr_reset_pixie_feedback",
@@ -560,7 +586,7 @@ for required in [
     "min(bbr_u32_add_sat(cwnd, acked), target_cwnd)",
 ]:
     if source.count(required) < 1:
-        fail(f"missing Pixie output marker: {required}")
+        fail(f"missing aggressive BBR output marker: {required}")
 
 source_path.write_text(source)
 tuned_sha256 = hashlib.sha256(source.encode()).hexdigest()
@@ -570,6 +596,11 @@ if provenance_path:
         f"BBR_STOCK_SOURCE_SHA256={stock_sha256}\n"
         f"BBR_TUNED_SOURCE_SHA256={tuned_sha256}\n"
         "BBR_BW_RTTS=10\n"
+        "BBR_STARTUP_GROWTH_NUMERATOR=9\n"
+        "BBR_STARTUP_GROWTH_DENOMINATOR=8\n"
+        "BBR_STARTUP_NO_GROWTH_RTTS=4\n"
+        "BBR_PROBE_BW_GAIN_PERCENT=150\n"
+        "BBR_PROBE_BW_DRAIN_PERCENT=75\n"
         "BBR_LT_LOSS_THRESH=96\n"
         "BBR_LT_BW_MAX_RTTS=24\n"
         "BBR_PIXIE_FEEDBACK_ENTRY_RTTS=1\n"
@@ -588,7 +619,7 @@ if provenance_path:
     )
 
 print(
-    "Applied BBRv1 Pixie compensation: one-RTT entry, four-RTT exit, "
-    "32-sample guard, 1.5x gain cap, idle reset, gradual cwnd growth, "
-    "and saturating cwnd arithmetic."
+    "Applied aggressive BBRv1 tuning: 12.5% STARTUP growth threshold, "
+    "four-round full-pipe confirmation, 1.5x ProbeBW probing, and Pixie "
+    "loss compensation with a 1.5x cap."
 )
