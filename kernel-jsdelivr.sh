@@ -17,7 +17,7 @@ die()  { printf '[x] %s\n' "$*" >&2; exit 1; }
 if [[ -n "${GITHUB_PROXY:-}" ]]; then
   GITHUB_PROXIES=("${GITHUB_PROXY%/}")
 else
-  GITHUB_PROXIES=(https://gh.llkk.cc https://gh-proxy.org https://ghproxy.net)
+  GITHUB_PROXIES=(https://gh-proxy.org)
 fi
 for github_proxy in "${GITHUB_PROXIES[@]}"; do
   [[ "$github_proxy" == https://* ]] || die "GITHUB_PROXY must use HTTPS: $github_proxy"
