@@ -74,6 +74,16 @@ sysctl net.core.default_qdisc
 
 正常情况下应看到 `-aggressive` 内核、`bbr` 和 `fq`。
 
+## 云 VPS 精简配置
+
+针对云 VPS 使用场景，精简 Linux 默认内核配置：
+
+- 禁用 Intel i915/Xe、AMD Radeon/AMDGPU、Nouveau 等显卡驱动。
+- 禁用音频、多媒体设备相关子系统。
+- 禁用蓝牙、Wi-Fi、NFC、CAN、IEEE 802.15.4、业余无线电等无线及专用通信子系统。
+- 禁用 FireWire、PCMCIA、并口、Thunderbolt、USB Gadget、游戏控制器、红外遥控等外设支持。
+- 将 Realtek PHY、tg3、e100、r8169 等需要固件的有线网卡驱动调整为模块，减少安装时无关的固件缺失告警。
+
 ## 默认网络参数
 
 安装器会写入 `/etc/sysctl.d/99-sysctl.conf`：

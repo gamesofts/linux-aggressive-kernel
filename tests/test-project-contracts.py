@@ -64,6 +64,31 @@ for required in [
 ]:
     assert required in config
 
+# Generic cloud guests must not build consumer device subsystems, while
+# core virtual networking and fallback physical Ethernet remain available.
+for feature in [
+    "DRM_I915", "DRM_XE", "DRM_AMDGPU", "DRM_RADEON",
+    "DRM_NOUVEAU", "DRM_GMA500", "SOUND", "MEDIA_SUPPORT",
+    "BT", "WLAN", "NFC", "CAN", "HAMRADIO", "IEEE802154",
+    "FIREWIRE", "PARPORT", "PCMCIA", "THUNDERBOLT",
+    "USB_GADGET", "INPUT_JOYSTICK", "RC_CORE",
+]:
+    assert f"--disable {feature}" in config
+for feature in [
+    "REALTEK_PHY", "TIGON3", "E100", "R8169", "SCSI_VIRTIO",
+    "ENA_ETHERNET", "GVE", "HYPERV_NET", "HYPERV_STORAGE",
+    "XEN_NETDEV_FRONTEND", "XEN_BLKDEV_FRONTEND",
+]:
+    assert f"--module {feature}" in config
+for feature in ["VIRTIO_NET", "VIRTIO_BLK", "VIRTIO_PCI", "BLK_DEV_NVME", "BLK_DEV_SD"]:
+    assert f"--enable {feature}" in config
+for feature in ["REALTEK_PHY", "TIGON3", "E100", "R8169"]:
+    assert feature in config
+assert 'cloud_disabled=(' in config
+assert 'for feature in "${cloud_disabled[@]}"; do' in config
+assert 'for driver in REALTEK_PHY TIGON3 E100 R8169; do' in config
+assert config.index("make olddefconfig") < config.index('cloud_disabled=(')
+
 for required in [
     'name: Build Linux Aggressive Kernel',
     'make -j"$(nproc)" bindeb-pkg',

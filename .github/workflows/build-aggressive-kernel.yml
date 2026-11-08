@@ -187,7 +187,7 @@ jobs:
           [[ "$BBR_PIXIE_CWND_GRADUAL_GROWTH" == 1 ]]
           [[ "$BBR_PIXIE_POLICER_MODEL" == 0 ]]
 
-      - name: Prepare generic kernel configuration
+      - name: Prepare cloud VPS kernel configuration
         working-directory: build/linux
         run: |
           set -euo pipefail

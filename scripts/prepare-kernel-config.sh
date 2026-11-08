@@ -73,6 +73,47 @@ scripts/config --file .config \
   --set-str SYSTEM_TRUSTED_KEYS '' \
   --set-str SYSTEM_REVOCATION_KEYS ''
 
+# The upstream defconfig carries desktop and physical-machine subsystems.
+# A cloud VPS needs neither GPU acceleration nor consumer radios, cameras,
+# audio, legacy peripheral buses, or local joystick/remote-control devices.
+# Keep virtual framebuffer/console, serial console, block/USB rescue paths
+# and PCI/ACPI/EFI support untouched for cloud recovery compatibility.
+# Avoid disabling network vendor families: some KVM guests emulate physical
+# NICs, and passthrough/SR-IOV may rely on vendor-specific NIC drivers.
+#
+# Removing GPU drivers also eliminates i915 built-in firmware warnings.
+# Preserve legacy wired NICs/PHYs as modules; missing device firmware must
+# still be installed on systems which actually use those physical adapters.
+scripts/config --file .config \
+  --disable DRM_I915 \
+  --disable DRM_XE \
+  --disable DRM_AMDGPU \
+  --disable DRM_RADEON \
+  --disable DRM_NOUVEAU \
+  --disable DRM_GMA500 \
+  --disable SOUND \
+  --disable MEDIA_SUPPORT \
+  --disable BT \
+  --disable WLAN \
+  --disable NFC \
+  --disable CAN \
+  --disable HAMRADIO \
+  --disable IEEE802154 \
+  --disable FIREWIRE \
+  --disable PARPORT \
+  --disable PCMCIA \
+  --disable THUNDERBOLT \
+  --disable USB_GADGET \
+  --disable INPUT_JOYSTICK \
+  --disable RC_CORE
+
+# Keep firmware-dependent Ethernet drivers loadable, not built-in.
+scripts/config --file .config \
+  --module REALTEK_PHY \
+  --module TIGON3 \
+  --module E100 \
+  --module R8169
+
 # Optional cloud drivers. Kconfig will silently discard symbols unavailable on
 # the current architecture.
 scripts/config --file .config \
@@ -85,6 +126,29 @@ scripts/config --file .config \
   --module XEN_BLKDEV_FRONTEND || true
 
 make olddefconfig
+
+# Kconfig may silently discard requests or re-select their symbols, so
+# inspect the resolved configuration on both x86_64 and arm64.
+cloud_disabled=(
+  DRM_I915 DRM_XE DRM_AMDGPU DRM_RADEON DRM_NOUVEAU DRM_GMA500
+  SOUND MEDIA_SUPPORT BT WLAN NFC CAN HAMRADIO IEEE802154
+  FIREWIRE PARPORT PCMCIA THUNDERBOLT USB_GADGET INPUT_JOYSTICK RC_CORE
+)
+for feature in "${cloud_disabled[@]}"; do
+  if grep -Eq "^CONFIG_${feature}=[ym]$" .config; then
+    printf 'Cloud VPS profile unexpectedly enabled CONFIG_%s\n' "$feature" >&2
+    exit 1
+  fi
+done
+
+# Physical Ethernet may still be useful for emulated/virtualized NICs.
+# None of these firmware-dependent drivers should be compiled into vmlinux.
+for driver in REALTEK_PHY TIGON3 E100 R8169; do
+  if grep -qx "CONFIG_${driver}=y" .config; then
+    printf 'Firmware-dependent NIC CONFIG_%s must be modular\n' "$driver" >&2
+    exit 1
+  fi
+done
 
 grep -qx 'CONFIG_TCP_CONG_BBR=y' .config
 grep -qx 'CONFIG_DEFAULT_BBR=y' .config
@@ -107,4 +171,4 @@ grep -qx 'CONFIG_NFT_FIB_IPV6=y' .config
 grep -qx 'CONFIG_NFT_FIB_INET=y' .config
 grep -qx 'CONFIG_EXT4_FS=y' .config
 grep -qx 'CONFIG_BLK_DEV_INITRD=y' .config
-printf 'Prepared generic Linux configuration with built-in BBR, fq and nftables NAT support.\n'
+printf 'Prepared cloud VPS Linux configuration with built-in BBR, fq and nftables NAT support.\n'
