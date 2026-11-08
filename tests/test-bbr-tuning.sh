@@ -26,10 +26,18 @@ struct bbr {
 	u32	lt_bw;		     /* LT est delivery rate in pkts/uS << 24 */
 	u32	lt_last_delivered;   /* LT intvl start: tp->delivered */
 	u32	lt_last_stamp;	     /* LT intvl start: tp->delivered_mstamp */
-	u32	lt_last_lost;	     /* LT intvl start: tp->lost */
+	u32	lt_last_lost;     /* LT intvl start: tp->lost */
 };
 static const int bbr_bw_rtts = CYCLE_LEN + 2;
 static const int bbr_pacing_margin_percent = 1;
+static const u32 bbr_full_bw_thresh = BBR_UNIT * 5 / 4;
+static const u32 bbr_full_bw_cnt = 3;
+static const int bbr_pacing_gain[] = {
+	BBR_UNIT * 5 / 4,	/* probe for more available bw */
+	BBR_UNIT * 3 / 4,	/* drain queue and/or yield bw to other flows */
+	BBR_UNIT, BBR_UNIT, BBR_UNIT,
+	BBR_UNIT, BBR_UNIT, BBR_UNIT
+};
 /* If lost/delivered ratio > 20%, interval is "lossy" and we may be policed: */
 static const u32 bbr_lt_loss_thresh = 50;
 static const u32 bbr_lt_bw_max_rtts = 48;
@@ -192,6 +200,10 @@ python3 "$repo_root/scripts/apply-aggressive-bbr.py" \
 
 grep -Fq 'static const int bbr_bw_rtts = CYCLE_LEN + 2;' "$source_file"
 grep -Fq 'static const int bbr_pacing_margin_percent = 0;' "$source_file"
+grep -Fq 'static const u32 bbr_full_bw_thresh = BBR_UNIT * 9 / 8;' "$source_file"
+grep -Fq 'static const u32 bbr_full_bw_cnt = 3;' "$source_file"
+grep -Fq $'\tBBR_UNIT * 3 / 2,\t/* aggressively probe for more available bw */' "$source_file"
+grep -Fq $'\tBBR_UNIT * 3 / 4,\t/* drain queue and/or yield bw to other flows */' "$source_file"
 grep -Fq 'static const u32 bbr_pixie_max_gain = (BBR_UNIT * 3) / 2;' "$source_file"
 grep -Fq 'static u32 bbr_pixie_gain(const struct sock *sk)' "$source_file"
 grep -Fq 'static void bbr_reset_pixie_feedback(struct sock *sk)' "$source_file"
@@ -211,7 +223,9 @@ grep -Fq 'w = bbr_apply_pixie_gain(bdp, bbr_pixie_gain(sk));' "$source_file"
 grep -Fq 'cwnd = min(bbr_u32_add_sat(cwnd, acked), target_cwnd);' "$source_file"
 grep -Fq 'target_cwnd = bbr_u32_add_sat(' "$source_file"
 grep -Fq 'inflight_at_edt = bbr_u32_add_sat(' "$source_file"
-grep -Fq 'MODULE_DESCRIPTION("TCP BBR with Pixie loss compensation");' "$source_file"
+grep -Fq 'MODULE_DESCRIPTION("TCP BBR with aggressive probing and Pixie loss compensation");' "$source_file"
+! grep -Fq 'static const u32 bbr_full_bw_thresh = BBR_UNIT * 5 / 4;' "$source_file"
+! grep -Fq $'\tBBR_UNIT * 5 / 4,\t/* probe for more available bw */' "$source_file"
 ! grep -Fq 'lt_use_bw' "$source_file"
 ! grep -Fq 'bbr_lt_bw_sampling(' "$source_file"
 ! grep -Fq 'bbr_reset_lt_bw_sampling(' "$source_file"
@@ -220,6 +234,11 @@ grep -Fq 'MODULE_DESCRIPTION("TCP BBR with Pixie loss compensation");' "$source_
 ! grep -Fq 'cwnd = target_cwnd;' "$source_file"
 
 grep -Fqx 'BBR_BW_RTTS=10' "$provenance_file"
+grep -Fqx 'BBR_STARTUP_GROWTH_NUMERATOR=9' "$provenance_file"
+grep -Fqx 'BBR_STARTUP_GROWTH_DENOMINATOR=8' "$provenance_file"
+grep -Fqx 'BBR_STARTUP_NO_GROWTH_RTTS=3' "$provenance_file"
+grep -Fqx 'BBR_PROBE_BW_GAIN_PERCENT=150' "$provenance_file"
+grep -Fqx 'BBR_PROBE_BW_DRAIN_PERCENT=75' "$provenance_file"
 grep -Fqx 'BBR_PIXIE_FEEDBACK_ENTRY_RTTS=1' "$provenance_file"
 grep -Fqx 'BBR_PIXIE_FEEDBACK_EXIT_RTTS=4' "$provenance_file"
 grep -Fqx 'BBR_PIXIE_MIN_SAMPLES=32' "$provenance_file"
@@ -237,4 +256,4 @@ if python3 "$repo_root/scripts/apply-aggressive-bbr.py" "$source_file" \
   exit 1
 fi
 
-printf 'BBRv1 Pixie adaptive hysteresis transformation: ok\n'
+printf 'BBRv1 aggressive probing + Pixie transformation: ok\n'

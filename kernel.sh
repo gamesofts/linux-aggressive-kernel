@@ -290,7 +290,13 @@ if not re.fullmatch(r"[0-9A-F]{40}", algorithm.get("linux_signing_fingerprint", 
 kernel = manifest.get("kernel", {})
 upstream_version = kernel.get("upstream_version", "")
 kernel_release = kernel.get("release", "")
-if kernel_release != f"{upstream_version}-aggressive":
+if not re.fullmatch(r"[0-9]+\.[0-9]+(?:\.[0-9]+)?", upstream_version):
+    raise SystemExit("Invalid upstream kernel version")
+normalized_upstream_version = (
+    f"{upstream_version}.0" if upstream_version.count(".") == 1 else upstream_version
+)
+expected_kernel_release = f"{normalized_upstream_version}-aggressive"
+if kernel_release != expected_kernel_release:
     raise SystemExit("Invalid kernel release")
 package = manifest.get("assets", {}).get(host_arch, {}).get(package_format, {}).get("image", {})
 name, digest, package_name, package_version = (package.get(k, "") for k in ("name", "sha256", "package", "version"))

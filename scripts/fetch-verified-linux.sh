@@ -4,7 +4,7 @@ set -euo pipefail
 version="${1:-}"
 output_file="${2:-}"
 provenance_file="${3:-}"
-[[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && -n "$output_file" ]] \
+[[ "$version" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ && -n "$output_file" ]] \
 	|| { printf 'Usage: %s KERNEL_VERSION OUTPUT_TAR_XZ [PROVENANCE_FILE]\n' "$0" >&2; exit 2; }
 
 for command_name in curl gpg sha256sum xz; do

@@ -239,7 +239,7 @@ jobs:
       - name: Validate packages and create manifest fragment
         run: |
           set -euo pipefail
-          kernel_release="${UPSTREAM_KERNEL_VERSION}${LOCALVERSION}"
+          kernel_release="$(make -s -C build/linux kernelrelease)"
 
           deb_contains_kernel() {
             dpkg-deb --contents "$1" 2>/dev/null \

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 version="${1:-}"
-[[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+[[ "$version" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] \
 	|| { printf 'Usage: %s KERNEL_VERSION\n' "$0" >&2; exit 2; }
 
 kernel_major="${version%%.*}"
