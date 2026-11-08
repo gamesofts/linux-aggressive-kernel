@@ -22,6 +22,17 @@ scripts/config --file .config \
   --enable NET \
   --enable INET \
   --enable IPV6 \
+  --enable NETFILTER \
+  --enable NF_CONNTRACK \
+  --enable NF_NAT \
+  --enable NF_TABLES \
+  --enable NF_TABLES_INET \
+  --enable NFT_CT \
+  --enable NFT_NAT \
+  --enable NFT_MASQ \
+  --enable NFT_FIB_IPV4 \
+  --enable NFT_FIB_IPV6 \
+  --enable NFT_FIB_INET \
   --enable TCP_CONG_ADVANCED \
   --enable TCP_CONG_BBR \
   --enable DEFAULT_BBR \
@@ -81,6 +92,19 @@ grep -qx 'CONFIG_DEFAULT_TCP_CONG="bbr"' .config
 grep -qx 'CONFIG_NET_SCH_FQ=y' .config
 grep -qx 'CONFIG_DEFAULT_FQ=y' .config
 grep -qx 'CONFIG_DEFAULT_NET_SCH="fq"' .config
+grep -qx 'CONFIG_NETFILTER=y' .config
+grep -qx 'CONFIG_NF_CONNTRACK=y' .config
+grep -qx 'CONFIG_NF_NAT=y' .config
+grep -qx 'CONFIG_NF_TABLES=y' .config
+grep -qx 'CONFIG_NF_TABLES_INET=y' .config
+grep -qx 'CONFIG_NF_TABLES_IPV4=y' .config
+grep -qx 'CONFIG_NF_TABLES_IPV6=y' .config
+grep -qx 'CONFIG_NFT_CT=y' .config
+grep -qx 'CONFIG_NFT_NAT=y' .config
+grep -qx 'CONFIG_NFT_MASQ=y' .config
+grep -qx 'CONFIG_NFT_FIB_IPV4=y' .config
+grep -qx 'CONFIG_NFT_FIB_IPV6=y' .config
+grep -qx 'CONFIG_NFT_FIB_INET=y' .config
 grep -qx 'CONFIG_EXT4_FS=y' .config
 grep -qx 'CONFIG_BLK_DEV_INITRD=y' .config
-printf 'Prepared generic Linux configuration with built-in BBR and fq.\n'
+printf 'Prepared generic Linux configuration with built-in BBR, fq and nftables NAT support.\n'
