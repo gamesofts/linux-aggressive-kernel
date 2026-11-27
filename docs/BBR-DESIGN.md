@@ -1,108 +1,83 @@
-# BBRv1 aggressive probing + Pixie loss-compensation design
+# BBRv1 aggressive probing + Pixie loss-compensation design (rev6)
 
 ## Goal
 
-Linux Aggressive Kernel keeps BBRv1's delivery-bandwidth and min-RTT model, makes STARTUP and ProbeBW more aggressive with fixed constants, and uses a bounded loss multiplier to determine the wire rate and inflight budget required to preserve delivered goodput on lossy paths.
+Linux Aggressive Kernel keeps BBRv1's delivery-bandwidth and min-RTT model while optimizing for **throughput-first, latency-aware** performance on high-RTT, lossy, and cross-border VPS paths:
 
-The design deliberately avoids dynamic path classification for bandwidth probing. The congestion-control name remains `bbr`, and fq pacing remains the expected qdisc.
+- Eliminates periodic `PROBE_RTT` throughput collapses and tail-loss RTOs with a `0.5 * BDP` target window.
+- Prevents self-inflicted congestion death spirals on shallow-buffer paths through phase-decoupled gains, `0.625x` drain symmetry, and queue-aware drain exit.
+- Removes per-ACK division overhead via an O(1) cached Pixie gain inside `struct bbr`.
+- Raises `sch_fq` default per-flow and global packet limits so non-TSO, tunnel, WireGuard, QUIC, and retransmit bursts do not trigger local `flows_plimit` drops that feed back into Pixie.
 
-## Aggressive probing
+The congestion-control name remains `bbr`, and `fq` pacing remains the default qdisc.
 
-The bandwidth-probing changes are intentionally simple:
+## Aggressive probing and drain symmetry
 
 ```text
-STARTUP growth threshold = 1.125
+STARTUP growth threshold       = 1.125 (9/8)
 STARTUP no-growth confirmation = 3 RTTs
-ProbeBW gains = 1.50, 0.75, 1, 1, 1, 1, 1, 1
+ProbeBW gains                  = 1.50, 0.625, 1, 1, 1, 1, 1, 1
+PROBE_RTT target cwnd          = max(0.5 * raw_BDP, 4)
+PROBE_RTT min_rtt window       = 15 seconds
 ```
 
-Stock BBRv1 considers bandwidth growth significant only when the current maximum reaches about 1.25 times the previous full-bandwidth estimate, and declares the pipe full after three non-growing rounds. Linux Aggressive Kernel lowers that growth threshold to 1.125 while retaining the original three-round full-pipe confirmation.
+- **STARTUP**: lowers the significant-growth threshold from `1.25` to `1.125` while keeping three confirmation rounds. Pixie is **not** stacked on top of `bbr_high_gain (2.885x)`, avoiding `4.33x` cold-start queue explosions.
+- **ProbeBW**: probes at `1.50x` for 1 RTT and drains at `0.625x (5/8)` for up to 1 RTT, followed by six `1.0x` cruise RTTs (cycle average `1.015625`). Critically, `0.625 * 1.50 = 0.9375 < 1.0`, guaranteeing that Drain always reduces queue occupancy even when Pixie is pinned at its `1.50x` cap.
+- **PROBE_RTT**: borrows BBRv2/v3's `max(0.5 * raw_BDP, 4)` target window (without Pixie inflation on `cwnd` or `pacing_rate`) across a 15-second `min_rtt` window. Because `0.5 * BDP < 1.0 * BDP`, bottleneck queues still drain to expose true propagation delay while retaining 50% throughput and avoiding `cwnd=4` RTO stalls.
 
-ProbeBW keeps the original eight-RTT cycle shape but changes only the first probe gain from 1.25 to 1.50. The following 0.75 drain RTT and six 1.0 cruise RTTs remain unchanged. The average gain over a complete cycle is therefore 1.03125.
-
-These probe gains affect the BBR actuation path but do not create a second bandwidth estimator. Successfully delivered traffic still determines BBR's delivery-bandwidth samples and max filter.
-
-## Core loss-compensation formula
+## Core loss-compensation formula and phase caps
 
 ```text
-raw_loss_gain = (acked + lost) / acked
-loss_gain = min(raw_loss_gain, 1.5)
-pacing_rate = BBR_pacing_rate * loss_gain
-cwnd_target = BBR_cwnd_target * loss_gain
+raw_loss_gain = 1 / (1 - p)    (from Q12 loss ratio across up to 4 ProbeBW RTTs)
+pixie_gain    = clamp(raw_loss_gain, 1.0, 1.5)
 ```
 
-With `p = lost / (acked + lost)`, the uncapped multiplier is `1 / (1 - p)` whenever at least one packet has been ACKed. A window with no valid ACK feedback uses a gain of 1.0.
+Phase-decoupled actuation prevents multiplicative gain blow-ups:
 
-The same 1.5 gain cap applies to pacing and compensated cwnd/inflight. It limits the requested wire rate and inflight budget to 150% of BBR's base output.
+| BBR Mode / Phase | Effective Pacing Gain | Effective Cwnd Gain |
+| :--- | :--- | :--- |
+| `BBR_STARTUP` | `2.885x` (no Pixie) | `2.885x` (no Pixie) |
+| `BBR_DRAIN` | `0.347x` (no Pixie) | `2.885x` (no Pixie) |
+| `BBR_PROBE_BW` Probe | `min(1.50 * pixie, 1.875x)` | `min(2.00 * pixie, 2.50x)` |
+| `BBR_PROBE_BW` Drain | `0.625 * pixie` (`<= 0.9375x`) | `min(2.00 * pixie, 2.50x)` |
+| `BBR_PROBE_BW` Cruise | `1.00 * pixie` (`<= 1.50x`) | `min(2.00 * pixie, 2.50x)` |
+| `BBR_PROBE_RTT` | `1.00x` (no Pixie) | `max(0.5 * raw_BDP, 4)` |
 
-## Adaptive feedback window
+## Queue-aware drain exit
 
-The feedback controller uses completed packet-timed RTTs and deliberately has different entry and exit behavior.
+`bbr_bdp()` is split into `bbr_bdp_raw()` (un-compensated model BDP) and `bbr_bdp()` (phase-capped actuation target):
 
-### Entry
+- `bbr_check_drain()` always exits `BBR_DRAIN` against `bbr_inflight_raw(bw, 1.0)`.
+- `bbr_is_next_cycle_phase()` during `ProbeBW` Drain inspects `srtt`:
+  - When `srtt > 1.125 * min_rtt` (standing queue present), Drain must reach `bbr_inflight_raw(bw, 1.0)` (or finish 1 full `min_rtt`), preventing congestion-induced Pixie gain from exiting Drain on the first ACK.
+  - When `srtt <= 1.125 * min_rtt` (clean random-loss path with empty queue), Drain exits early at the compensated `1.0 * wire_BDP` target so pure random-loss throughput is never wasted.
 
-While compensation is inactive, only the newest completed RTT is examined. Compensation becomes active when that RTT contains at least 32 packet observations and at least one observed loss. This allows a real loss signal to affect the next round without waiting for a long history.
+## Adaptive Q12 feedback window, deadband, and O(1) hot path
 
-### Maintenance
+- **Mode isolation**: only completed `BBR_PROBE_BW` rounds update the 4-RTT history. `STARTUP`/`DRAIN` queue overflows and `PROBE_RTT` low-flight rounds cannot pollute the model.
+- **Undersized-round guard**: rounds with fewer than `BBR_PIXIE_MIN_SAMPLES (32)` packets are skipped so keepalive traffic cannot evict loaded rounds.
+- **Q12 precision + 0.5% deadband**: each 16-bit slot stores a valid bit and a 12-bit loss fraction (`1/4096 ≈ 0.024%` resolution). Loss ratios below `0.5%` (`lost * 200 < total`) are treated as clean (`0`), preventing single sporadic packet drops on high-BDP paths from locking compensation on.
+- **Fast entry / slow exit**: enters after 1 completed `ProbeBW` round above the 0.5% deadband; exits only after 4 consecutive completed rounds remain below the deadband.
+- **O(1) cached hot path**: `struct bbr` stores `pixie_gain_cached:10` inside existing unused bitfield space (zero `struct bbr` size growth, still within `ICSK_CA_PRIV_SIZE`). `pixie_gain_cached` is recomputed once per completed RTT using a single 32-bit integer division; every per-ACK call to `bbr_pixie_gain()` is an O(1) read with zero loops and zero divisions.
 
-Once active, the gain uses every available completed RTT in the most recent four-RTT history:
+## High-BDP `sch_fq` defaults
+
+`scripts/apply-fq-tuning.py` tunes `net/sched/sch_fq.c` defaults so `net.core.default_qdisc = fq` works out-of-the-box without local `flows_plimit` drops:
 
 ```text
-window_samples = sum(samples from up to 4 completed RTTs)
-window_lost = sum(losses from up to 4 completed RTTs)
-window_acked = window_samples - window_lost
+sch->limit     = 32768  (stock: 10000)
+q->flow_plimit = 2000   (stock: 100)
+q->fq_trees_log = ilog2(4096) (stock: ilog2(1024))
 ```
 
-The 32-sample threshold is only an activation guard. Reaching it does not stop accumulation; all retained rounds continue to contribute to the active gain.
+Runtime `tc qdisc change` overrides continue to work normally.
 
-### Exit
+## Source, toolchain, and build model
 
-Compensation does not exit after one clean RTT. It exits only when four completed RTTs are available and the complete four-RTT history contains no observed loss. This hysteresis makes entry fast while preventing short clean intervals from repeatedly disabling and re-enabling compensation.
+The project tracks the latest kernel.org stable release and verifies the downloaded tarball against a kernel.org maintainer signature. `scripts/apply-aggressive-bbr.py` transforms `net/ipv4/tcp_bbr.c` and `scripts/apply-fq-tuning.py` transforms `net/sched/sch_fq.c`, rejecting unexpected source layouts.
 
-The fixed BBR private-state area stores four completed RTT buckets plus full current-round ACK/loss counters. Completed rounds are ratio-preserving normalized buckets so the four-RTT history fits without increasing `struct bbr` beyond `ICSK_CA_PRIV_SIZE`.
-
-## Idle restart
-
-When BBR detects an application-limited transmit restart, the completed-round history, current counters, and active state are cleared. New traffic starts with a gain of 1.0 and must satisfy the one-RTT entry rule again.
-
-## Bandwidth model
-
-The delivery-rate max filter uses `CYCLE_LEN + 2`. Neither the fixed aggressive probe gain nor the bounded loss gain is written into delivery-rate samples or the max filter. BBR continues to model successfully delivered bandwidth, while the gains determine how aggressively that model is tested and how much extra wire traffic is used to compensate for loss.
-
-## Pacing
-
-```text
-base_rate = bbr_rate_bytes_per_sec(bw, pacing_gain)
-wire_rate = base_rate * loss_gain
-pacing_rate = min(wire_rate, sk_max_pacing_rate)
-```
-
-During ProbeBW's first phase, `pacing_gain` is 1.5. During STARTUP the normal BBR high gain is retained. The pacing margin is 0%, so the base output is not reduced before compensation.
-
-## Cwnd and inflight
-
-`bbr_bdp()` applies the same bounded loss multiplier to the BDP target. Cwnd growth remains ACK-paced:
-
-```text
-cwnd = min(saturating_add(cwnd, acked), target_cwnd)
-```
-
-Before full bandwidth is reached, STARTUP growth also uses saturated addition. The final cwnd remains capped by `snd_cwnd_clamp`.
-
-## Loss recovery
-
-TCP loss detection, SACK, RACK, TLP, RTO, retransmission queues, and recovery state remain active. The BBR loss-response path does not subtract newly marked losses from cwnd and does not enable BBR packet conservation. ACK/loss feedback continues to determine the bounded pacing and target-cwnd multiplier during recovery.
-
-## BBR modes
-
-The implementation retains STARTUP, DRAIN, ProbeBW, ProbeRTT, min-RTT measurement, ACK aggregation, TSO/GSO quantization, and fq/socket pacing limits. STARTUP uses the 12.5% growth threshold with the original three-round full-pipe confirmation, and ProbeBW uses the fixed `1.50, 0.75, 1, 1, 1, 1, 1, 1` gain cycle. The BBRv1 long-term policer estimator is not used. `bbr_bw()` always returns the windowed delivery-bandwidth maximum.
-
-## Source and build model
-
-The project tracks the latest kernel.org stable release and verifies the downloaded source against a kernel.org maintainer signature. `scripts/apply-aggressive-bbr.py` transforms only `net/ipv4/tcp_bbr.c` and rejects unexpected source layouts.
-
-The kernel configuration starts from the upstream architecture defconfig and enables the networking, storage, filesystems and virtualization features needed by mainstream VPS/cloud environments. CI validates the transformation with GCC and Clang on amd64 and arm64, then builds and validates both DEB and RPM packages plus a signed-source provenance manifest.
+Release kernels are built on amd64 and arm64 with **Clang + ThinLTO (`LLVM=1`, `CONFIG_LTO_CLANG_THIN=y`)**, `CONFIG_PREEMPT_LAZY=y` + `CONFIG_PREEMPT_DYNAMIC=y`, `CONFIG_HZ_250=y`, Netfilter Flowtable offload, TPROXY/policy routing, kTLS, WireGuard, hardware crypto acceleration, and trimmed cloud VPS drivers. CI also compiles `tcp_bbr.o` and `sch_fq.o` with GCC to enforce dual-compiler cleanliness.
 
 ## Network experiment matrix
 
-Recommended tests cover RTTs of 20, 100, 250, and 600 ms; random and burst loss; forward, reverse, and bidirectional loss; capacity changes; post-bottleneck corruption; queue drops; policers; shallow queues; and competing BBR/CUBIC flows. Record delivered goodput, wire throughput, retransmitted bytes, RTO/TLP counts, p50/p95/p99 RTT, pacing rate, cwnd, delivery-bandwidth estimate, and recovery time after path changes.
+`tests/bench-netem.sh` provides a reproducible Linux `netns` + `veth` + `tc netem` + `tbf` + `iperf3` benchmark harness covering clean high-BDP links, random-loss cross-border links (2% / 5% / 15%), shallow-buffer congestion links (`0.5 BDP` `tbf`), and mixed evening-peak paths with competing flows.

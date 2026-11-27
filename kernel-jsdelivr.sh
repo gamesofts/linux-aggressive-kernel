@@ -344,9 +344,14 @@ algorithm = manifest.get("algorithm", {})
 if algorithm.get("name") != "bbr" or algorithm.get("source") != "linux-mainline" or algorithm.get("source_file") != "net/ipv4/tcp_bbr.c":
     raise SystemExit("Unexpected congestion-control source metadata")
 expected_tuning = {
-    "revision": 5, "bw_rtts": 10, "feedback_entry_rtts": 1,
-    "feedback_exit_rtts": 4, "min_samples": 32, "max_gain_percent": 150,
-    "lt_loss_thresh": 96, "lt_bw_max_rtts": 24,
+    "revision": 6, "bw_rtts": 10, "min_rtt_win_sec": 15,
+    "probe_rtt_cwnd_gain_percent": 50, "probe_bw_gain_percent": 150,
+    "probe_bw_drain_percent": 62, "feedback_entry_rtts": 1,
+    "feedback_exit_rtts": 4, "min_samples": 32, "deadband_bps": 50,
+    "max_gain_percent": 150, "probe_max_gain_percent": 187,
+    "cwnd_max_gain_percent": 250, "lt_loss_thresh": 96,
+    "lt_bw_max_rtts": 24, "fq_default_plimit": 32768,
+    "fq_default_flow_plimit": 2000, "fq_default_buckets": 4096,
 }
 if algorithm.get("tuning") != expected_tuning:
     raise SystemExit("Unsupported BBRv1 Pixie tuning")

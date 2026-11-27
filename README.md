@@ -2,59 +2,57 @@
 
 [![Build Linux Aggressive Kernel](https://github.com/gamesofts/linux-aggressive-kernel/actions/workflows/build-aggressive-kernel.yml/badge.svg)](https://github.com/gamesofts/linux-aggressive-kernel/actions/workflows/build-aggressive-kernel.yml)
 
-Linux Aggressive Kernel 是一个面向高延迟、丢包和跨境链路的实验性 Linux 内核，基于 Linux BBRv1，目标很直接：**在链路还有可用容量时，更积极地把吞吐榨出来。**
+Linux Aggressive Kernel 是一个面向高延迟、丢包和跨境链路的实验性 Linux 内核，基于 Linux BBRv1，目标很直接：**在吞吐优先的前提下兼顾延迟，把链路可用容量更稳、更高效地榨出来。**
 
-支持 amd64/x86_64 和 arm64/aarch64，提供 DEB / RPM 构建与安装。
+支持 amd64/x86_64 和 arm64/aarch64，使用 **Clang + ThinLTO** 构建，提供 DEB / RPM 安装包。
 
-## 核心思路
+## 核心优化（rev6）
 
-项目主要做两件事：**激进探测**和**激进补偿**。
-
-### 1. 激进探测
-
-BBR 依靠实际交付速率持续估计链路带宽，并在 STARTUP 和 ProbeBW 中主动尝试更高的发送速率。本项目增强这两个阶段的探测力度：
+### 1. 激进探测与对称排空
 
 ```text
-STARTUP：带宽还能增长 12.5% 时继续扩张
-ProbeBW：1.50, 0.75, 1, 1, 1, 1, 1, 1
+STARTUP：带宽还能增长 12.5% 时继续扩张（不叠加 Pixie，避免冷启动打爆浅队列）
+ProbeBW：1.50, 0.625, 1, 1, 1, 1, 1, 1（周期均速 1.015625）
+PROBE_RTT：窗口降至 max(0.5 * raw_BDP, 4)，周期 15s（保留 50% 吞吐并消除 cwnd=4 RTO）
 ```
 
-STARTUP 将“仍有显著带宽增长”的门槛设为 **12.5%**，让高 RTT、抖动明显的链路有更多机会继续向上发现容量。
+- **STARTUP**：显著增长门槛设为 **12.5%**，且不叠加 Pixie 倍速，避免建连瞬间以 `4.33x` 冲垮浅缓冲 VPS/限速器。
+- **ProbeBW**：保持 **1.50x** 主动探测，同时将 Drain 相调整为 **0.625x（5/8）**——即便 Pixie 触发上限 `1.50x`，Drain 实际线速仍为 `0.625 × 1.50 = 0.9375 < 1.0`，从数学上杜绝队列“越排越满”；配合队列感知退出机制，纯随机丢包且无排队时立即回到巡航不损吞吐，存在常驻排队时则真正排空队列压低延迟。
+- **PROBE_RTT**：借鉴 BBRv2/v3，将探测窗口从硬砍 `4` 包升级为 **`max(0.5 * BDP, 4)`** 并适度放宽至 `15s` 周期，消除每 10 秒一次的吞吐归零暴跌与尾部丢包 RTO 卡顿。
 
-进入稳定阶段后，ProbeBW 每个 8 RTT 周期会用 1 个 RTT 以 **1.5 倍当前带宽估计**主动探测更多容量，随后以 0.75 倍排掉探测产生的额外队列，再回到正常巡航。
+### 2. 分阶段解耦、零除法的 Pixie 激进补偿
 
-如果更高的发送量确实带来了更高的 ACK 交付速率，新的 delivery-rate sample 会自然进入 BBR 原有的带宽 max filter；如果额外流量只是变成排队或丢包，则不会凭空抬高 BBR 的带宽估计。
-
-### 2. 激进补偿
-
-对于随机丢包，项目借鉴 [Pixie](https://github.com/marywangran/pixie) 的思路：根据最近完整 RTT 的成功包与丢失包计算补偿，丢掉多少，就适当多发送多少，尽量维持有效吞吐。
+借鉴 [Pixie](https://github.com/marywangran/pixie) 思路，根据最近 4 个完整 `ProbeBW` RTT 的高精度 Q12 丢包率计算补偿：
 
 ```text
-补偿系数 = min((成功包 + 丢失包) / 成功包, 1.5)
+补偿系数 = clamp(1 / (1 - p), 1.0, 1.5)   （< 0.5% 死区不触发）
 
-发送速率 = BBR 发送速率 × 补偿系数
-窗口目标 = BBR 窗口目标 × 补偿系数
+Probe 相线速 = min(1.50 × 补偿系数, 1.875) × BBR_bw
+Cruise 相线速 = 1.00 × 补偿系数 × BBR_bw   （最高 1.50x）
+Drain 相线速  = 0.625 × 补偿系数 × BBR_bw  （最高 0.9375x）
+ProbeBW 窗口  = min(2.00 × 补偿系数, 2.50) × BBR_BDP
 ```
 
-| 丢包率 | 补偿系数 |
-| ---: | ---: |
-| 10% | 约 1.11 倍 |
-| 20% | 1.25 倍 |
-| 25% | 约 1.33 倍 |
-| 33% 及以上 | 最高 1.5 倍 |
+- **抗污染反馈**：仅在稳态 `ProbeBW` 且回合样本 `>= 32` 包时写入 4-RTT 历史；`STARTUP`/`DRAIN` 队列溢出与 `PROBE_RTT` 低速回合不再污染补偿模型。
+- **0.5% 死区 + Q12 精度（0.024%）**：避免高 BDP 链路偶发 1 个丢包被 20~65 倍放大导致补偿长期误锁。
+- **ACK 热路径 O(1) 零除法**：在 `struct bbr` 原有空闲位域缓存 `pixie_gain_cached`（零结构体膨胀），每 RTT 仅计算一次，热路径零循环、零 64 位除法。
 
-补偿同时作用于 pacing rate 和 cwnd/inflight，避免只提高发送速率却被窗口限制。补偿只作用在实际发送层，不会直接写回 BBR 的 delivered-bandwidth 估计；只有真正成功交付的数据才能把 BBR 的基础带宽估计抬高。
+### 3. 高 BDP `sch_fq` 默认值调优
+
+微调 `net/sched/sch_fq.c` 默认参数（`limit=32768`、`flow_plimit=2000`、`buckets=4096`），消除非 TSO / WireGuard / TUN / QUIC / 高丢包重传场景下默认 `flow_limit=100` 引发的本地 `flows_plimit` 丢包与 Pixie 正反馈死循环。
+
+### 4. Clang ThinLTO 与云 VPS 高吞吐数据面
+
+- **Clang + ThinLTO (`LLVM=1`, `CONFIG_LTO_CLANG_THIN=y`)**：跨文件内联优化 socket ↔ TCP ↔ BBR ↔ `fq` ↔ Netfilter ↔ `virtio_net` 热路径。
+- **调度与时钟统一**：`CONFIG_PREEMPT_LAZY=y` + `CONFIG_PREEMPT_DYNAMIC=y` + `CONFIG_HZ_250=y` + `NO_HZ_IDLE`，减少 KVM VM-exit 与持锁抢占开销，兼顾高吞吐与低调度尾延迟。
+- **转发与加密加速**：内置 Netfilter Flowtable 快速转发（`NF_FLOW_TABLE` / `NFT_FLOW_OFFLOAD`）、透明代理与策略路由（`NFT_TPROXY` / `NFT_SOCKET` / `IP_MULTIPLE_TABLES`）、模块化 kTLS / WireGuard 与 x86_64/arm64 硬件密码指令加速，以及 BPF JIT、MGLRU、THP `madvise`、`KVM_GUEST` + `PARAVIRT_SPINLOCKS`。
 
 ## 适合什么网络
 
-比较适合：
-
-- 中国大陆与海外之间的长距离链路
-- 高 RTT、随机丢包明显的 VPS / 云服务器线路
+- 中国大陆与海外之间的长距离高 RTT 跨境链路
+- 存在随机丢包或浅队列波动的 VPS / 云服务器线路
 - 移动网络、无线网络、卫星网络
-- 标准 BBR 吞吐明显低于链路实际能力的场景
-
-它的目标不是最低延迟或最公平的带宽共享，而是更偏向**吞吐优先**。激进探测和激进补偿都可能带来更高的瞬时排队延迟和更多线速流量，这是预期行为。
+- NAT 转发、WireGuard / TLS 加密代理与高并发中转节点
 
 ## 安装
 
@@ -104,25 +102,12 @@ net.ipv4.tcp_mtu_probing = 1
 net.ipv4.tcp_ecn = 0
 ```
 
-## 设计要点
+## 量化基准验证
 
-- 保留 BBRv1 的 delivery-bandwidth、min-RTT、STARTUP、DRAIN、ProbeBW 和 ProbeRTT 基础框架。
-- STARTUP 的显著带宽增长门槛调整为 12.5%。
-- ProbeBW 的主动探测增益提高到 1.5 倍。
-- 丢包补偿最高 1.5 倍，并同时放大 pacing 和 inflight 目标。
-- 探测和补偿都不会直接写回 BBR 的 delivered-bandwidth 估计，带宽模型仍由实际成功交付的数据更新。
-- 不使用 BBRv1 的长期 policer 低速模式，避免高随机丢包把连接长期锁在低速状态。
-- TCP 的 SACK、RACK、TLP、RTO 和重传机制仍然正常工作。
+仓库提供基于 `netns` + `veth` + `tc netem` + `tbf` + `iperf3` 的自动化测试脚本 [tests/bench-netem.sh](tests/bench-netem.sh)，可在安装目标内核的 Linux 主机（root）上复现高 BDP、随机丢包、浅缓冲拥塞及晚高峰混合场景测试。
 
 ## 注意
 
-这是实验性内核。相比标准 BBR，它会更主动地制造探测和补偿流量，因此可能出现：
-
-- 满载时延迟更高
-- 短时间队列增加
-- 丢包线路上实际发送流量高于有效吞吐
-- 与其他流竞争时更具攻击性
-
-建议先在可回滚的 VPS / 测试环境中使用，并保留一个可启动的发行版原生内核。
+这是实验性内核。相比标准 BBR，它会更主动地进行带宽探测与丢包补偿，在极度拥塞链路下仍可能比保守算法更具攻击性。建议先在可回滚的 VPS / 测试环境中使用，并保留一个可启动的发行版原生内核。
 
 更详细的算法说明见 [BBR-DESIGN.md](docs/BBR-DESIGN.md)。

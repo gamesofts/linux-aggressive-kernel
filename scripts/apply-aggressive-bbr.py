@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Port Pixie's loss compensation and simple aggressive probing into Linux BBRv1."""
+"""Port Pixie's loss compensation and throughput-first BBRv1 tuning into Linux."""
 
 import hashlib
 import re
@@ -61,6 +61,25 @@ def replace_bbr_private_state(source: str, new: str) -> str:
     return source[:matches[0].start()] + new + source[matches[0].end():]
 
 
+def replace_check_drain(source: str) -> str:
+    """Use un-compensated raw BDP for STARTUP->DRAIN->ProbeBW exit checks."""
+    pattern = re.compile(
+        r"static void bbr_check_drain\(struct sock \*sk, const struct rate_sample \*rs\)\n\{.*?\n\}\n",
+        re.S,
+    )
+    matches = list(pattern.finditer(source))
+    if len(matches) != 1:
+        fail(f"expected exactly one bbr_check_drain definition, found {len(matches)}")
+    block = matches[0].group(0)
+    if block.count("bbr_inflight(sk, bbr_max_bw(sk), BBR_UNIT)") != 2:
+        fail("unexpected bbr_check_drain body layout")
+    updated = block.replace(
+        "bbr_inflight(sk, bbr_max_bw(sk), BBR_UNIT)",
+        "bbr_inflight_raw(sk, bbr_max_bw(sk), BBR_UNIT)",
+    )
+    return source[:matches[0].start()] + updated + source[matches[0].end():]
+
+
 if len(sys.argv) not in {2, 3}:
     fail("usage: apply-stock-bbr-tuning.py TCP_BBR_C [PROVENANCE_ENV]")
 
@@ -82,6 +101,12 @@ require_once(
 )
 source = replace_once(
     source,
+    "static const u32 bbr_min_rtt_win_sec = 10;",
+    "static const u32 bbr_min_rtt_win_sec = 15;",
+    "stock min_rtt window duration",
+)
+source = replace_once(
+    source,
     '/* If lost/delivered ratio > 20%, interval is "lossy" and we may be policed: */',
     '/* Legacy build anchor; Pixie compensation replaces BBRv1 policer use. */',
     "stock policer threshold comment",
@@ -98,6 +123,18 @@ source = replace_once(
     "static const u32 bbr_lt_bw_max_rtts __maybe_unused = 24;",
     "stock policer duration",
 )
+for legacy_const in (
+    "static const u32 bbr_lt_intvl_min_rtts = 4;",
+    "static const u32 bbr_lt_bw_ratio = BBR_UNIT / 8;",
+    "static const u32 bbr_lt_bw_diff = 4000 / 8;",
+):
+    if legacy_const in source:
+        source = replace_once(
+            source,
+            legacy_const,
+            legacy_const.replace(" = ", " __maybe_unused = ", 1),
+            f"legacy policer constant {legacy_const}",
+        )
 source = replace_once(
     source,
     "static const int bbr_pacing_margin_percent = 1;",
@@ -105,10 +142,10 @@ source = replace_once(
     "stock pacing margin",
 )
 
-# Keep the probing policy deliberately simple and fixed. STARTUP considers a
-# 12.5% delivery-rate increase meaningful and waits three flat rounds before
-# declaring the pipe full. ProbeBW uses one 1.5x probe RTT followed by the
-# stock 0.75x drain RTT and six 1.0x cruise RTTs.
+# Keep probing simple and throughput-first while ensuring drain stability:
+# STARTUP uses a 12.5% growth threshold with three flat confirmation rounds.
+# ProbeBW probes at 1.50x and drains at 0.625x (5/8), guaranteeing that even
+# at the 1.50x Pixie cap the drain wire gain stays strictly below 1.0 (0.9375x).
 source = replace_once(
     source,
     "static const u32 bbr_full_bw_thresh = BBR_UNIT * 5 / 4;",
@@ -126,17 +163,34 @@ source = replace_once(
     "\tBBR_UNIT * 3 / 2,\t/* aggressively probe for more available bw */",
     "BBRv1 ProbeBW probe gain",
 )
+source = replace_once(
+    source,
+    "\tBBR_UNIT * 3 / 4,\t/* drain queue and/or yield bw to other flows */",
+    "\tBBR_UNIT * 5 / 8,\t/* drain queue symmetrically even under Pixie cap */",
+    "BBRv1 ProbeBW drain gain",
+)
+source = replace_once(
+    source,
+    "static const u32 bbr_cwnd_min_target = 4;",
+    "static const u32 bbr_cwnd_min_target = 4;\n"
+    "/* Target half-BDP cwnd during PROBE_RTT (BBRv2/v3 style) to drain queues\n"
+    " * without collapsing throughput or triggering tail-loss RTOs.\n"
+    " */\n"
+    "static const int bbr_probe_rtt_cwnd_gain = BBR_UNIT / 2;",
+    "BBRv1 PROBE_RTT cwnd gain",
+)
 
 new_state = '''\tu32     mode:3,\t\t     /* current bbr_mode in state machine */
 \t\tprev_ca_state:3,     /* CA state on previous ACK */
 \t\tpacket_conservation:1,  /* retained ABI bit; forced off */
 \t\tround_start:1,\t     /* start of packet-timed tx->ack round? */
 \t\tidle_restart:1,\t     /* restarting after idle? */
-\t\tprobe_rtt_round_done:1,  /* a BBR_PROBE_RTT round at 4 pkts? */
+\t\tprobe_rtt_round_done:1,  /* a BBR_PROBE_RTT round done? */
 \t\tpixie_active:1,\t     /* loss compensation is active */
 \t\tpixie_round_head:2,  /* newest completed feedback round */
 \t\tpixie_round_count:3, /* valid completed feedback rounds */
-\t\tunused:16;
+\t\tpixie_gain_cached:10,/* cached Pixie gain in [256..384] */
+\t\tunused:6;
 \tu32\tpixie_rounds[2];  /* four packed completed feedback rounds */
 \tu32\tpixie_round_acked;   /* ACKed packets in current round */
 \tu32\tpixie_round_lost;    /* lost packets in current round */
@@ -164,10 +218,15 @@ static u32 bbr_u32_add_sat(u32 value, u32 delta)
 
 #define BBR_PIXIE_MAX_RTTS 4
 #define BBR_PIXIE_MIN_SAMPLES 32
-#define BBR_PIXIE_ROUND_SHIFT 8
-#define BBR_PIXIE_ROUND_MASK U8_MAX
+#define BBR_PIXIE_LOSS_SCALE 12
+#define BBR_PIXIE_LOSS_UNIT (1U << BBR_PIXIE_LOSS_SCALE)
+#define BBR_PIXIE_LOSS_MASK (BBR_PIXIE_LOSS_UNIT - 1)
+#define BBR_PIXIE_ROUND_VALID (1U << 15)
+#define BBR_PIXIE_DEADBAND_DENOM 200
 
 static const u32 bbr_pixie_max_gain = (BBR_UNIT * 3) / 2;
+static const u32 bbr_pixie_probe_max_gain = (BBR_UNIT * 15) / 8;
+static const u32 bbr_pixie_cwnd_max_gain = (BBR_UNIT * 5) / 2;
 
 static u16 bbr_pixie_get_round(const struct bbr *bbr, u32 index)
 {
@@ -194,72 +253,107 @@ static void bbr_reset_pixie_feedback(struct sock *sk)
 \tbbr->pixie_active = 0;
 \tbbr->pixie_round_head = 0;
 \tbbr->pixie_round_count = 0;
+\tbbr->pixie_gain_cached = BBR_UNIT;
 \tbbr->pixie_round_acked = 0;
 \tbbr->pixie_round_lost = 0;
 }
 
-/* Store one completed RTT in a compact ratio-preserving bucket. The sample
- * guard uses the true count up to U8_MAX; larger rounds are normalized so all
- * four RTTs can remain in BBR's fixed private-state budget.
+/* Encode one completed ProbeBW RTT in a 16-bit Q12 loss-ratio bucket.
+ * Undersized rounds (< BBR_PIXIE_MIN_SAMPLES) are ignored so keepalive or
+ * sparse interactive traffic cannot evict loaded rounds. Losses below the
+ * 0.5% deadband are treated as clean to prevent single-packet noise on
+ * high-BDP paths from locking compensation on.
  */
 static u16 bbr_pixie_pack_round(u32 acked, u32 lost)
 {
 \tu64 total = (u64)acked + lost;
-\tu32 samples, scaled_lost;
+\tu32 loss_q12;
 
-\tif (!total)
+\tif (total < BBR_PIXIE_MIN_SAMPLES)
 \t\treturn 0;
-\tsamples = min_t(u64, total, U8_MAX);
-\tscaled_lost = div64_u64((u64)lost * samples + total / 2, total);
-\t/* Preserve whether each completed RTT observed any loss. */
-\tif (lost && !scaled_lost)
-\t\tscaled_lost = 1;
-\tif (acked && scaled_lost >= samples)
-\t\tscaled_lost = samples - 1;
-\treturn (samples << BBR_PIXIE_ROUND_SHIFT) | scaled_lost;
+\tif (!lost || (u64)lost * BBR_PIXIE_DEADBAND_DENOM < total)
+\t\treturn BBR_PIXIE_ROUND_VALID;
+\tloss_q12 = div64_u64((u64)lost * BBR_PIXIE_LOSS_UNIT + total / 2, total);
+\tif (!loss_q12)
+\t\tloss_q12 = 1;
+\tif (loss_q12 >= BBR_PIXIE_LOSS_UNIT)
+\t\tloss_q12 = BBR_PIXIE_LOSS_UNIT - 1;
+\treturn (u16)(BBR_PIXIE_ROUND_VALID | loss_q12);
 }
 
 static void bbr_pixie_collect_rounds(const struct bbr *bbr, u32 rounds,
-\t\t\t\t     u64 *samples, u64 *losses)
+\t\t\t\t     u32 *valid_rounds, u32 *loss_sum)
 {
 \tu32 i;
 
-\t*samples = 0;
-\t*losses = 0;
+\t*valid_rounds = 0;
+\t*loss_sum = 0;
 \trounds = min(rounds, (u32)bbr->pixie_round_count);
 \tfor (i = 0; i < rounds; i++) {
 \t\tu32 index = (bbr->pixie_round_head - i) &
 \t\t\t    (BBR_PIXIE_MAX_RTTS - 1);
 \t\tu16 packed = bbr_pixie_get_round(bbr, index);
 
-\t\t*samples += packed >> BBR_PIXIE_ROUND_SHIFT;
-\t\t*losses += packed & BBR_PIXIE_ROUND_MASK;
+\t\tif (!(packed & BBR_PIXIE_ROUND_VALID))
+\t\t\tcontinue;
+\t\t(*valid_rounds)++;
+\t\t*loss_sum += packed & BBR_PIXIE_LOSS_MASK;
 \t}
+}
+
+/* Recompute and cache the bounded Pixie multiplier once per completed RTT so
+ * the per-ACK pacing/cwnd hot path performs zero loops and zero divisions.
+ */
+static void bbr_pixie_recompute_gain(struct bbr *bbr)
+{
+\tu32 valid_rounds, loss_sum, denom, gain;
+
+\tif (!bbr->pixie_active || !bbr->pixie_round_count) {
+\t\tbbr->pixie_gain_cached = BBR_UNIT;
+\t\treturn;
+\t}
+\tbbr_pixie_collect_rounds(bbr, BBR_PIXIE_MAX_RTTS,
+\t\t\t\t &valid_rounds, &loss_sum);
+\tif (!valid_rounds || !loss_sum) {
+\t\tbbr->pixie_gain_cached = BBR_UNIT;
+\t\treturn;
+\t}
+\tdenom = valid_rounds * BBR_PIXIE_LOSS_UNIT;
+\tif (loss_sum >= denom) {
+\t\tbbr->pixie_gain_cached = bbr_pixie_max_gain;
+\t\treturn;
+\t}
+\tgain = (denom * BBR_UNIT) / (denom - loss_sum);
+\tbbr->pixie_gain_cached = clamp_t(u32, gain, BBR_UNIT,
+\t\t\t\t\t bbr_pixie_max_gain);
 }
 
 static void bbr_pixie_update_active(struct bbr *bbr)
 {
-\tu64 samples, losses;
+\tu32 valid_rounds, loss_sum;
 
 \tif (!bbr->pixie_round_count) {
 \t\tbbr->pixie_active = 0;
+\t\tbbr->pixie_gain_cached = BBR_UNIT;
 \t\treturn;
 \t}
 \tif (!bbr->pixie_active) {
-\t\t/* Enter quickly from the newest complete RTT. */
-\t\tbbr_pixie_collect_rounds(bbr, 1, &samples, &losses);
-\t\tif (samples >= BBR_PIXIE_MIN_SAMPLES && losses)
+\t\t/* Enter quickly from the newest complete ProbeBW RTT. */
+\t\tbbr_pixie_collect_rounds(bbr, 1, &valid_rounds, &loss_sum);
+\t\tif (valid_rounds && loss_sum)
 \t\t\tbbr->pixie_active = 1;
+\t\tbbr_pixie_recompute_gain(bbr);
 \t\treturn;
 \t}
 
-\t/* Exit only after four complete RTTs contain no observed loss. */
-\tif (bbr->pixie_round_count < BBR_PIXIE_MAX_RTTS)
-\t\treturn;
-\tbbr_pixie_collect_rounds(bbr, BBR_PIXIE_MAX_RTTS,
-\t\t\t\t &samples, &losses);
-\tif (samples >= BBR_PIXIE_MIN_SAMPLES && !losses)
-\t\tbbr->pixie_active = 0;
+\t/* Exit only after four complete RTTs remain below the deadband. */
+\tif (bbr->pixie_round_count >= BBR_PIXIE_MAX_RTTS) {
+\t\tbbr_pixie_collect_rounds(bbr, BBR_PIXIE_MAX_RTTS,
+\t\t\t\t\t &valid_rounds, &loss_sum);
+\t\tif (valid_rounds >= BBR_PIXIE_MAX_RTTS && !loss_sum)
+\t\t\tbbr->pixie_active = 0;
+\t}
+\tbbr_pixie_recompute_gain(bbr);
 }
 
 static void bbr_pixie_store_completed_round(struct bbr *bbr)
@@ -278,38 +372,45 @@ static void bbr_pixie_store_completed_round(struct bbr *bbr)
 \tbbr_pixie_update_active(bbr);
 }
 
-/* Compensate delivered goodput by the observed wire-loss ratio:
- *
- *   compensation = min((acked + lost) / acked, 1.5)
- *
- * Entry uses one complete packet-timed RTT with at least 32 observations.
- * Once active, every available completed RTT in the four-RTT history is used,
- * and compensation exits only after four completed RTTs show no loss.
- */
+/* O(1) hot-path read of the cached Pixie loss-compensation multiplier. */
 static u32 bbr_pixie_gain(const struct sock *sk)
 {
 \tconst struct bbr *bbr = inet_csk_ca(sk);
-\tu64 samples, lost, acked, gain;
 
-\tif (!bbr->pixie_active)
-\t\treturn BBR_UNIT;
-\tbbr_pixie_collect_rounds(bbr, BBR_PIXIE_MAX_RTTS,
-\t\t\t\t &samples, &lost);
-\tif (samples < BBR_PIXIE_MIN_SAMPLES || lost >= samples)
-\t\treturn BBR_UNIT;
-\tacked = samples - lost;
-\tgain = div64_u64(samples << BBR_SCALE, acked);
-\treturn min_t(u64, max_t(u64, gain, BBR_UNIT),
-\t\t     bbr_pixie_max_gain);
+\treturn bbr->pixie_active ? bbr->pixie_gain_cached : BBR_UNIT;
 }
 
-static u64 bbr_apply_pixie_gain(u64 value, u32 gain)
+/* Apply phase-aware Pixie pacing compensation:
+ * - STARTUP, DRAIN, and PROBE_RTT never stack Pixie (prevents 4.33x startup
+ *   overflows and min_rtt measurement distortion).
+ * - ProbeBW Probe caps combined gain at 1.875x instead of 2.25x.
+ * - ProbeBW Drain (0.625x) stays <= 0.9375x even at the 1.5x Pixie cap.
+ * - ProbeBW Cruise applies the full bounded Pixie multiplier (up to 1.5x).
+ */
+static int bbr_effective_pacing_gain(const struct sock *sk, int gain)
 {
-\tif (gain <= BBR_UNIT)
-\t\treturn value;
-\tif (value > U64_MAX / gain)
-\t\treturn U64_MAX;
-\treturn (value * gain) >> BBR_SCALE;
+\tconst struct bbr *bbr = inet_csk_ca(sk);
+\tu32 pixie = bbr_pixie_gain(sk);
+\tu64 combined;
+
+\tif (pixie <= BBR_UNIT || bbr->mode != BBR_PROBE_BW)
+\t\treturn gain;
+\tcombined = ((u64)gain * pixie) >> BBR_SCALE;
+\tif (gain > BBR_UNIT)
+\t\tcombined = min_t(u64, combined, bbr_pixie_probe_max_gain);
+\treturn (int)combined;
+}
+
+static int bbr_effective_cwnd_gain(const struct sock *sk, int gain)
+{
+\tconst struct bbr *bbr = inet_csk_ca(sk);
+\tu32 pixie = bbr_pixie_gain(sk);
+\tu64 combined;
+
+\tif (pixie <= BBR_UNIT || bbr->mode != BBR_PROBE_BW)
+\t\treturn gain;
+\tcombined = ((u64)gain * pixie) >> BBR_SCALE;
+\treturn (int)min_t(u64, combined, bbr_pixie_cwnd_max_gain);
 }
 '''
 source = replace_once(source, old_bw, new_bw, "BBRv1 bandwidth selector")
@@ -327,8 +428,8 @@ new_pacing = '''static unsigned long bbr_bw_to_pacing_rate(struct sock *sk, u32 
 {
 \tu64 rate = bw;
 
+\tgain = bbr_effective_pacing_gain(sk, gain);
 \trate = bbr_rate_bytes_per_sec(sk, rate, gain);
-\trate = bbr_apply_pixie_gain(rate, bbr_pixie_gain(sk));
 \trate = min_t(u64, rate, READ_ONCE(sk->sk_max_pacing_rate));
 \treturn rate;
 }
@@ -351,18 +452,67 @@ source = replace_once(
     "BBRv1 idle restart feedback reset",
 )
 
-old_bdp_tail = '''\tbdp = (((w * gain) >> BBR_SCALE) + BW_UNIT - 1) / BW_UNIT;
+old_bdp_fn = '''static u32 bbr_bdp(struct sock *sk, u32 bw, int gain)
+{
+\tstruct bbr *bbr = inet_csk_ca(sk);
+\tu32 bdp;
+\tu64 w;
+
+\t/* If we've never had a valid RTT sample, cap cwnd at the initial
+\t * default. This should only happen when the connection is not using TCP
+\t * timestamps and has retransmitted all of the SYN/SYNACK/data packets
+\t * ACKed so far. In this case, an RTO can cut cwnd to 1, in which
+\t * case we need to slow-start up toward something safe: TCP_INIT_CWND.
+\t */
+\tif (unlikely(bbr->min_rtt_us == ~0U))	 /* no valid RTT samples yet? */
+\t\treturn TCP_INIT_CWND;  /* be safe: cap at default initial cwnd*/
+
+\tw = (u64)bw * bbr->min_rtt_us;
+
+\t/* Apply a gain to the given value, remove the BW_SCALE shift, and
+\t * round the value up to avoid a negative feedback loop.
+\t */
+\tbdp = (((w * gain) >> BBR_SCALE) + BW_UNIT - 1) / BW_UNIT;
 
 \treturn bdp;
 }
 '''
-new_bdp_tail = '''\tbdp = (((w * gain) >> BBR_SCALE) + BW_UNIT - 1) / BW_UNIT;
-\tw = bbr_apply_pixie_gain(bdp, bbr_pixie_gain(sk));
+new_bdp_fn = '''static u32 bbr_bdp_raw(struct sock *sk, u32 bw, int gain)
+{
+\tstruct bbr *bbr = inet_csk_ca(sk);
+\tu64 w, bdp;
 
-\treturn min_t(u64, w, U32_MAX);
+\t/* If we've never had a valid RTT sample, cap cwnd at the initial
+\t * default. This should only happen when the connection is not using TCP
+\t * timestamps and has retransmitted all of the SYN/SYNACK/data packets
+\t * ACKed so far. In this case, an RTO can cut cwnd to 1, in which
+\t * case we need to slow-start up toward something safe: TCP_INIT_CWND.
+\t */
+\tif (unlikely(bbr->min_rtt_us == ~0U))\t /* no valid RTT samples yet? */
+\t\treturn TCP_INIT_CWND;  /* be safe: cap at default initial cwnd*/
+
+\tw = (u64)bw * bbr->min_rtt_us;
+
+\t/* Apply a gain to the given value, remove the BW_SCALE shift, and
+\t * round the value up to avoid a negative feedback loop.
+\t */
+\tbdp = (((w * gain) >> BBR_SCALE) + BW_UNIT - 1) / BW_UNIT;
+
+\treturn min_t(u64, bdp, U32_MAX);
+}
+
+static u32 bbr_bdp(struct sock *sk, u32 bw, int gain)
+{
+\treturn bbr_bdp_raw(sk, bw, bbr_effective_cwnd_gain(sk, gain));
+}
+
+static u32 bbr_probe_rtt_cwnd(struct sock *sk)
+{
+\treturn max(bbr_bdp_raw(sk, bbr_bw(sk), bbr_probe_rtt_cwnd_gain),
+\t\t   bbr_cwnd_min_target);
 }
 '''
-source = replace_once(source, old_bdp_tail, new_bdp_tail, "BBRv1 BDP return")
+source = replace_once(source, old_bdp_fn, new_bdp_fn, "BBRv1 BDP calculation")
 
 source = replace_once(
     source,
@@ -391,6 +541,31 @@ source = replace_once(
 ''',
     "BBRv1 quantization cwnd additions",
 )
+
+old_inflight = '''/* Find inflight based on min RTT and the estimated bottleneck bandwidth. */
+static u32 bbr_inflight(struct sock *sk, u32 bw, int gain)
+{
+\tu32 inflight;
+
+\tinflight = bbr_bdp(sk, bw, gain);
+\tinflight = bbr_quantization_budget(sk, inflight);
+
+\treturn inflight;
+}
+'''
+new_inflight = '''/* Find un-compensated inflight based on min RTT and bottleneck bandwidth. */
+static u32 bbr_inflight_raw(struct sock *sk, u32 bw, int gain)
+{
+\tu32 inflight;
+
+\tinflight = bbr_bdp_raw(sk, bw, gain);
+\tinflight = bbr_quantization_budget(sk, inflight);
+
+\treturn inflight;
+}
+'''
+source = replace_once(source, old_inflight, new_inflight, "BBRv1 inflight helper")
+
 source = replace_once(
     source,
     '''\tif (bbr->pacing_gain > BBR_UNIT)              /* increasing inflight */
@@ -414,12 +589,21 @@ source = replace_once(
     "BBRv1 ACK aggregation maximum",
 )
 
-pixie_feedback = '''/* Update adaptive completed-round Pixie feedback. */
+pixie_feedback = '''/* Update adaptive completed-round Pixie feedback during steady-state ProbeBW. */
 static void bbr_update_pixie_feedback(struct sock *sk,
 \t\t\t\t      const struct rate_sample *rs)
 {
 \tstruct bbr *bbr = inet_csk_ca(sk);
 
+\t/* Ignore STARTUP/DRAIN queue-overflow losses and PROBE_RTT low-flight
+\t * rounds so self-inflicted overshoot or min-RTT dips cannot poison the
+\t * four-RTT loss-compensation history.
+\t */
+\tif (bbr->mode != BBR_PROBE_BW) {
+\t\tbbr->pixie_round_acked = 0;
+\t\tbbr->pixie_round_lost = 0;
+\t\treturn;
+\t}
 \t/* The ACK that starts a new BBR round belongs to the new round. */
 \tif (bbr->round_start) {
 \t\tbbr_pixie_store_completed_round(bbr);
@@ -500,6 +684,65 @@ source = replace_once(
 )
 source = replace_once(
     source,
+    '''\tif (bbr->mode == BBR_PROBE_RTT)  /* drain queue, refresh min_rtt */
+\t\ttcp_snd_cwnd_set(tp, min(tcp_snd_cwnd(tp), bbr_cwnd_min_target));
+''',
+    '''\tif (bbr->mode == BBR_PROBE_RTT)  /* drain queue, refresh min_rtt */
+\t\ttcp_snd_cwnd_set(tp, min(tcp_snd_cwnd(tp), bbr_probe_rtt_cwnd(sk)));
+''',
+    "BBRv1 PROBE_RTT cwnd cap",
+)
+
+old_cycle_phase = '''\tif (bbr->pacing_gain > BBR_UNIT)
+\t\treturn is_full_length &&
+\t\t\t(rs->losses ||  /* perhaps pacing_gain*BDP won't fit */
+\t\t\t inflight >= bbr_inflight(sk, bw, bbr->pacing_gain));
+
+\t/* A pacing_gain < 1.0 tries to drain extra queue we added if bw
+\t * probing didn't find more bw. If inflight falls to match BDP then we
+\t * estimate queue is drained; persisting would underutilize the pipe.
+\t */
+\treturn is_full_length ||
+\t\tinflight <= bbr_inflight(sk, bw, BBR_UNIT);
+'''
+new_cycle_phase = '''\tif (bbr->pacing_gain > BBR_UNIT)
+\t\treturn is_full_length &&
+\t\t\t(rs->losses ||  /* perhaps pacing_gain*BDP won't fit */
+\t\t\t inflight >= bbr_inflight_raw(
+\t\t\t\tsk, bw,
+\t\t\t\tbbr_effective_pacing_gain(sk, bbr->pacing_gain)));
+
+\t/* A pacing_gain < 1.0 tries to drain extra queue we added if bw
+\t * probing didn't find more bw. When RTT shows standing queue buildup
+\t * (> 1.125 * min_rtt), drain toward raw BDP so congestion-triggered
+\t * Pixie gain cannot exit Drain immediately. On clean random-loss paths
+\t * with no standing queue, exit at the compensated BDP target to keep
+\t * throughput high.
+\t */
+\tif (tp->srtt_us && bbr->min_rtt_us != ~0U &&
+\t    (tp->srtt_us >> 3) > bbr->min_rtt_us + (bbr->min_rtt_us >> 3))
+\t\treturn is_full_length ||
+\t\t\tinflight <= bbr_inflight_raw(sk, bw, BBR_UNIT);
+\treturn is_full_length ||
+\t\tinflight <= bbr_inflight_raw(
+\t\t\tsk, bw, bbr_effective_pacing_gain(sk, BBR_UNIT));
+'''
+source = replace_once(source, old_cycle_phase, new_cycle_phase, "BBRv1 cycle phase exit")
+source = replace_check_drain(source)
+
+source = replace_once(
+    source,
+    '''\t\tif (!bbr->probe_rtt_done_stamp &&
+\t\t    tcp_packets_in_flight(tp) <= bbr_cwnd_min_target) {
+''',
+    '''\t\tif (!bbr->probe_rtt_done_stamp &&
+\t\t    tcp_packets_in_flight(tp) <= bbr_probe_rtt_cwnd(sk)) {
+''',
+    "BBRv1 PROBE_RTT inflight trigger",
+)
+
+source = replace_once(
+    source,
     '''\tcase BBR_PROBE_BW:
 \t\tbbr->pacing_gain = (bbr->lt_use_bw ?
 \t\t\t\t    BBR_UNIT :
@@ -576,22 +819,35 @@ for forbidden in [
     "pixie_acked -=",
     "pixie_lost -=",
     "prev_total > curr_total",
+    "bbr_inflight(",
 ]:
     if forbidden in source:
         fail(f"stale or unsafe BBRv1 state remains: {forbidden}")
 for required in [
     "static const int bbr_bw_rtts = CYCLE_LEN + 2;",
+    "static const u32 bbr_min_rtt_win_sec = 15;",
     "static const u32 bbr_full_bw_thresh = BBR_UNIT * 9 / 8;",
     "static const u32 bbr_full_bw_cnt = 3;",
+    "static const int bbr_probe_rtt_cwnd_gain = BBR_UNIT / 2;",
     "BBR_UNIT * 3 / 2,\t/* aggressively probe for more available bw */",
+    "BBR_UNIT * 5 / 8,\t/* drain queue symmetrically even under Pixie cap */",
+    "pixie_gain_cached:10",
     "bbr_pixie_gain",
-    "bbr_apply_pixie_gain",
+    "bbr_pixie_recompute_gain",
+    "bbr_effective_pacing_gain",
+    "bbr_effective_cwnd_gain",
+    "bbr_bdp_raw",
+    "bbr_inflight_raw",
+    "bbr_probe_rtt_cwnd",
     "bbr_reset_pixie_feedback",
     "bbr_update_pixie_feedback",
     "bbr_u32_add_sat",
     "bbr_pixie_max_gain",
+    "bbr_pixie_probe_max_gain",
+    "bbr_pixie_cwnd_max_gain",
     "BBR_PIXIE_MAX_RTTS",
     "BBR_PIXIE_MIN_SAMPLES",
+    "BBR_PIXIE_DEADBAND_DENOM",
     "bbr_pixie_pack_round",
     "bbr_pixie_store_completed_round",
     "bbr_pixie_update_active",
@@ -610,18 +866,24 @@ if provenance_path:
         f"BBR_STOCK_SOURCE_SHA256={stock_sha256}\n"
         f"BBR_TUNED_SOURCE_SHA256={tuned_sha256}\n"
         "BBR_BW_RTTS=10\n"
+        "BBR_MIN_RTT_WIN_SEC=15\n"
+        "BBR_PROBE_RTT_CWND_GAIN_PERCENT=50\n"
         "BBR_STARTUP_GROWTH_NUMERATOR=9\n"
         "BBR_STARTUP_GROWTH_DENOMINATOR=8\n"
         "BBR_STARTUP_NO_GROWTH_RTTS=3\n"
         "BBR_PROBE_BW_GAIN_PERCENT=150\n"
-        "BBR_PROBE_BW_DRAIN_PERCENT=75\n"
+        "BBR_PROBE_BW_DRAIN_PERCENT=62\n"
         "BBR_LT_LOSS_THRESH=96\n"
         "BBR_LT_BW_MAX_RTTS=24\n"
         "BBR_PIXIE_FEEDBACK_ENTRY_RTTS=1\n"
         "BBR_PIXIE_FEEDBACK_EXIT_RTTS=4\n"
         "BBR_PIXIE_MIN_SAMPLES=32\n"
-        "BBR_PIXIE_FEEDBACK_WINDOW=adaptive_hysteresis_completed_rounds\n"
+        "BBR_PIXIE_DEADBAND_BPS=50\n"
+        "BBR_PIXIE_FEEDBACK_WINDOW=adaptive_hysteresis_q12_probe_bw_rounds\n"
         "BBR_PIXIE_MAX_GAIN_PERCENT=150\n"
+        "BBR_PIXIE_PROBE_MAX_GAIN_PERCENT=187\n"
+        "BBR_PIXIE_CWND_MAX_GAIN_PERCENT=250\n"
+        "BBR_PIXIE_HOTPATH_CACHED=1\n"
         "BBR_PIXIE_IDLE_RESET=1\n"
         "BBR_PIXIE_PACING_COMPENSATION=1\n"
         "BBR_PIXIE_CWND_COMPENSATION=1\n"
@@ -633,7 +895,7 @@ if provenance_path:
     )
 
 print(
-    "Applied aggressive BBRv1 tuning: 12.5% STARTUP growth threshold, "
-    "three-round full-pipe confirmation, 1.5x ProbeBW probing, and Pixie "
-    "loss compensation with a 1.5x cap."
+    "Applied aggressive BBRv1 tuning (rev6): 0.5*BDP PROBE_RTT (15s), "
+    "12.5% STARTUP growth, 1.50x/0.625x ProbeBW, phase-decoupled cached "
+    "Q12 Pixie compensation (0.5% deadband, 1.50x cap), and queue-aware drain."
 )

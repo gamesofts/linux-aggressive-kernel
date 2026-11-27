@@ -29,7 +29,9 @@ struct bbr {
 	u32	lt_last_lost;     /* LT intvl start: tp->lost */
 };
 static const int bbr_bw_rtts = CYCLE_LEN + 2;
+static const u32 bbr_min_rtt_win_sec = 10;
 static const int bbr_pacing_margin_percent = 1;
+static const u32 bbr_cwnd_min_target = 4;
 static const u32 bbr_full_bw_thresh = BBR_UNIT * 5 / 4;
 static const u32 bbr_full_bw_cnt = 3;
 static const int bbr_pacing_gain[] = {
@@ -38,8 +40,11 @@ static const int bbr_pacing_gain[] = {
 	BBR_UNIT, BBR_UNIT, BBR_UNIT,
 	BBR_UNIT, BBR_UNIT, BBR_UNIT
 };
+static const u32 bbr_lt_intvl_min_rtts = 4;
 /* If lost/delivered ratio > 20%, interval is "lossy" and we may be policed: */
 static const u32 bbr_lt_loss_thresh = 50;
+static const u32 bbr_lt_bw_ratio = BBR_UNIT / 8;
+static const u32 bbr_lt_bw_diff = 4000 / 8;
 static const u32 bbr_lt_bw_max_rtts = 48;
 
 static u32 bbr_max_bw(const struct sock *sk) { return 1; }
@@ -80,7 +85,22 @@ static u32 bbr_bdp(struct sock *sk, u32 bw, int gain)
 {
 	struct bbr *bbr = inet_csk_ca(sk);
 	u32 bdp;
-	u64 w = bw;
+	u64 w;
+
+	/* If we've never had a valid RTT sample, cap cwnd at the initial
+	 * default. This should only happen when the connection is not using TCP
+	 * timestamps and has retransmitted all of the SYN/SYNACK/data packets
+	 * ACKed so far. In this case, an RTO can cut cwnd to 1, in which
+	 * case we need to slow-start up toward something safe: TCP_INIT_CWND.
+	 */
+	if (unlikely(bbr->min_rtt_us == ~0U))	 /* no valid RTT samples yet? */
+		return TCP_INIT_CWND;  /* be safe: cap at default initial cwnd*/
+
+	w = (u64)bw * bbr->min_rtt_us;
+
+	/* Apply a gain to the given value, remove the BW_SCALE shift, and
+	 * round the value up to avoid a negative feedback loop.
+	 */
 	bdp = (((w * gain) >> BBR_SCALE) + BW_UNIT - 1) / BW_UNIT;
 
 	return bdp;
@@ -100,6 +120,17 @@ static u32 bbr_quantization_budget(struct sock *sk, u32 cwnd)
 	if (bbr->mode == BBR_PROBE_BW && bbr->cycle_idx == 0)
 		cwnd += 2;
 	return cwnd;
+}
+
+/* Find inflight based on min RTT and the estimated bottleneck bandwidth. */
+static u32 bbr_inflight(struct sock *sk, u32 bw, int gain)
+{
+	u32 inflight;
+
+	inflight = bbr_bdp(sk, bw, gain);
+	inflight = bbr_quantization_budget(sk, inflight);
+
+	return inflight;
 }
 
 static u32 bbr_packets_in_net_at_edt(struct sock *sk, u32 inflight_now)
@@ -136,6 +167,24 @@ static void bbr_set_cwnd(struct sock *sk)
 		cwnd = min(cwnd + acked, target_cwnd);
 	else if (cwnd < target_cwnd || tp->delivered < TCP_INIT_CWND)
 		cwnd = cwnd + acked;
+	if (bbr->mode == BBR_PROBE_RTT)  /* drain queue, refresh min_rtt */
+		tcp_snd_cwnd_set(tp, min(tcp_snd_cwnd(tp), bbr_cwnd_min_target));
+}
+
+static bool bbr_is_next_cycle_phase(struct sock *sk,
+				    const struct rate_sample *rs)
+{
+	if (bbr->pacing_gain > BBR_UNIT)
+		return is_full_length &&
+			(rs->losses ||  /* perhaps pacing_gain*BDP won't fit */
+			 inflight >= bbr_inflight(sk, bw, bbr->pacing_gain));
+
+	/* A pacing_gain < 1.0 tries to drain extra queue we added if bw
+	 * probing didn't find more bw. If inflight falls to match BDP then we
+	 * estimate queue is drained; persisting would underutilize the pipe.
+	 */
+	return is_full_length ||
+		inflight <= bbr_inflight(sk, bw, BBR_UNIT);
 }
 
 /* Start a new long-term sampling interval. */
@@ -147,6 +196,31 @@ static void bbr_lt_bw_sampling(struct sock *sk, const struct rate_sample *rs) { 
 static void bbr_update_bw(struct sock *sk, const struct rate_sample *rs)
 {
 	bbr_lt_bw_sampling(sk, rs);
+}
+
+static void bbr_check_drain(struct sock *sk, const struct rate_sample *rs)
+{
+	struct bbr *bbr = inet_csk_ca(sk);
+
+	if (bbr->mode == BBR_STARTUP && bbr_full_bw_reached(sk)) {
+		bbr->mode = BBR_DRAIN;
+		WRITE_ONCE(tcp_sk(sk)->snd_ssthresh,
+			   bbr_inflight(sk, bbr_max_bw(sk), BBR_UNIT));
+	}
+	if (bbr->mode == BBR_DRAIN &&
+	    bbr_packets_in_net_at_edt(sk, tcp_packets_in_flight(tcp_sk(sk))) <=
+	    bbr_inflight(sk, bbr_max_bw(sk), BBR_UNIT))
+		bbr_reset_probe_bw_mode(sk);
+}
+
+static void bbr_update_min_rtt(struct sock *sk, const struct rate_sample *rs)
+{
+	if (bbr->mode == BBR_PROBE_RTT) {
+		if (!bbr->probe_rtt_done_stamp &&
+		    tcp_packets_in_flight(tp) <= bbr_cwnd_min_target) {
+			bbr->probe_rtt_done_stamp = 1;
+		}
+	}
 }
 
 static void bbr_update_gains(struct sock *sk)
@@ -199,33 +273,41 @@ python3 "$repo_root/scripts/apply-aggressive-bbr.py" \
   "$source_file" "$provenance_file" >/dev/null
 
 grep -Fq 'static const int bbr_bw_rtts = CYCLE_LEN + 2;' "$source_file"
+grep -Fq 'static const u32 bbr_min_rtt_win_sec = 15;' "$source_file"
 grep -Fq 'static const int bbr_pacing_margin_percent = 0;' "$source_file"
 grep -Fq 'static const u32 bbr_full_bw_thresh = BBR_UNIT * 9 / 8;' "$source_file"
 grep -Fq 'static const u32 bbr_full_bw_cnt = 3;' "$source_file"
+grep -Fq 'static const int bbr_probe_rtt_cwnd_gain = BBR_UNIT / 2;' "$source_file"
 grep -Fq $'\tBBR_UNIT * 3 / 2,\t/* aggressively probe for more available bw */' "$source_file"
-grep -Fq $'\tBBR_UNIT * 3 / 4,\t/* drain queue and/or yield bw to other flows */' "$source_file"
+grep -Fq $'\tBBR_UNIT * 5 / 8,\t/* drain queue symmetrically even under Pixie cap */' "$source_file"
+grep -Fq 'pixie_gain_cached:10,' "$source_file"
 grep -Fq 'static const u32 bbr_pixie_max_gain = (BBR_UNIT * 3) / 2;' "$source_file"
+grep -Fq 'static const u32 bbr_pixie_probe_max_gain = (BBR_UNIT * 15) / 8;' "$source_file"
+grep -Fq 'static const u32 bbr_pixie_cwnd_max_gain = (BBR_UNIT * 5) / 2;' "$source_file"
 grep -Fq 'static u32 bbr_pixie_gain(const struct sock *sk)' "$source_file"
+grep -Fq 'static void bbr_pixie_recompute_gain(struct bbr *bbr)' "$source_file"
+grep -Fq 'static int bbr_effective_pacing_gain(const struct sock *sk, int gain)' "$source_file"
+grep -Fq 'static int bbr_effective_cwnd_gain(const struct sock *sk, int gain)' "$source_file"
+grep -Fq 'static u32 bbr_bdp_raw(struct sock *sk, u32 bw, int gain)' "$source_file"
+grep -Fq 'static u32 bbr_inflight_raw(struct sock *sk, u32 bw, int gain)' "$source_file"
+grep -Fq 'static u32 bbr_probe_rtt_cwnd(struct sock *sk)' "$source_file"
 grep -Fq 'static void bbr_reset_pixie_feedback(struct sock *sk)' "$source_file"
 grep -Fq 'static u32 bbr_u32_add_sat(u32 value, u32 delta)' "$source_file"
 grep -Fq '#define BBR_PIXIE_MAX_RTTS 4' "$source_file"
 grep -Fq '#define BBR_PIXIE_MIN_SAMPLES 32' "$source_file"
-grep -Fq 'static void bbr_pixie_update_active(struct bbr *bbr)' "$source_file"
-grep -Fq 'if (lost && !scaled_lost)' "$source_file"
-grep -Fq 'if (acked && scaled_lost >= samples)' "$source_file"
-grep -Fq 'bbr_pixie_collect_rounds(bbr, 1, &samples, &losses);' "$source_file"
-grep -Fq 'bbr_pixie_collect_rounds(bbr, BBR_PIXIE_MAX_RTTS,' "$source_file"
-grep -Fq 'bbr_pixie_max_gain);' "$source_file"
-grep -Fq 'bbr_pixie_store_completed_round(bbr);' "$source_file"
-grep -Fq 'bbr_reset_pixie_feedback(sk);' "$source_file"
-grep -Fq 'rate = bbr_apply_pixie_gain(rate, bbr_pixie_gain(sk));' "$source_file"
-grep -Fq 'w = bbr_apply_pixie_gain(bdp, bbr_pixie_gain(sk));' "$source_file"
+grep -Fq '#define BBR_PIXIE_DEADBAND_DENOM 200' "$source_file"
+grep -Fq 'if (bbr->mode != BBR_PROBE_BW)' "$source_file"
+grep -Fq 'bbr_probe_rtt_cwnd(sk)));' "$source_file"
+grep -Fq 'tcp_packets_in_flight(tp) <= bbr_probe_rtt_cwnd(sk))' "$source_file"
+grep -Fq 'gain = bbr_effective_pacing_gain(sk, gain);' "$source_file"
 grep -Fq 'cwnd = min(bbr_u32_add_sat(cwnd, acked), target_cwnd);' "$source_file"
 grep -Fq 'target_cwnd = bbr_u32_add_sat(' "$source_file"
 grep -Fq 'inflight_at_edt = bbr_u32_add_sat(' "$source_file"
 grep -Fq 'MODULE_DESCRIPTION("TCP BBR with aggressive probing and Pixie loss compensation");' "$source_file"
 ! grep -Fq 'static const u32 bbr_full_bw_thresh = BBR_UNIT * 5 / 4;' "$source_file"
 ! grep -Fq $'\tBBR_UNIT * 5 / 4,\t/* probe for more available bw */' "$source_file"
+! grep -Fq $'\tBBR_UNIT * 3 / 4,\t/* drain queue and/or yield bw to other flows */' "$source_file"
+! grep -Fq 'bbr_inflight(' "$source_file"
 ! grep -Fq 'lt_use_bw' "$source_file"
 ! grep -Fq 'bbr_lt_bw_sampling(' "$source_file"
 ! grep -Fq 'bbr_reset_lt_bw_sampling(' "$source_file"
@@ -234,16 +316,22 @@ grep -Fq 'MODULE_DESCRIPTION("TCP BBR with aggressive probing and Pixie loss com
 ! grep -Fq 'cwnd = target_cwnd;' "$source_file"
 
 grep -Fqx 'BBR_BW_RTTS=10' "$provenance_file"
+grep -Fqx 'BBR_MIN_RTT_WIN_SEC=15' "$provenance_file"
+grep -Fqx 'BBR_PROBE_RTT_CWND_GAIN_PERCENT=50' "$provenance_file"
 grep -Fqx 'BBR_STARTUP_GROWTH_NUMERATOR=9' "$provenance_file"
 grep -Fqx 'BBR_STARTUP_GROWTH_DENOMINATOR=8' "$provenance_file"
 grep -Fqx 'BBR_STARTUP_NO_GROWTH_RTTS=3' "$provenance_file"
 grep -Fqx 'BBR_PROBE_BW_GAIN_PERCENT=150' "$provenance_file"
-grep -Fqx 'BBR_PROBE_BW_DRAIN_PERCENT=75' "$provenance_file"
+grep -Fqx 'BBR_PROBE_BW_DRAIN_PERCENT=62' "$provenance_file"
 grep -Fqx 'BBR_PIXIE_FEEDBACK_ENTRY_RTTS=1' "$provenance_file"
 grep -Fqx 'BBR_PIXIE_FEEDBACK_EXIT_RTTS=4' "$provenance_file"
 grep -Fqx 'BBR_PIXIE_MIN_SAMPLES=32' "$provenance_file"
-grep -Fqx 'BBR_PIXIE_FEEDBACK_WINDOW=adaptive_hysteresis_completed_rounds' "$provenance_file"
+grep -Fqx 'BBR_PIXIE_DEADBAND_BPS=50' "$provenance_file"
+grep -Fqx 'BBR_PIXIE_FEEDBACK_WINDOW=adaptive_hysteresis_q12_probe_bw_rounds' "$provenance_file"
 grep -Fqx 'BBR_PIXIE_MAX_GAIN_PERCENT=150' "$provenance_file"
+grep -Fqx 'BBR_PIXIE_PROBE_MAX_GAIN_PERCENT=187' "$provenance_file"
+grep -Fqx 'BBR_PIXIE_CWND_MAX_GAIN_PERCENT=250' "$provenance_file"
+grep -Fqx 'BBR_PIXIE_HOTPATH_CACHED=1' "$provenance_file"
 grep -Fqx 'BBR_PIXIE_IDLE_RESET=1' "$provenance_file"
 grep -Fqx 'BBR_PIXIE_CWND_SATURATING_ARITHMETIC=1' "$provenance_file"
 grep -Fqx 'BBR_PIXIE_CWND_GRADUAL_GROWTH=1' "$provenance_file"
@@ -256,4 +344,4 @@ if python3 "$repo_root/scripts/apply-aggressive-bbr.py" "$source_file" \
   exit 1
 fi
 
-printf 'BBRv1 aggressive probing + Pixie transformation: ok\n'
+printf 'BBRv1 aggressive probing + Pixie transformation (rev6): ok\n'

@@ -67,20 +67,31 @@ jobs:
           source metadata/aggressive-bbr.env
 
           [[ "$PROFILE_NAME" == linux-aggressive-bbr-v1 ]]
-          [[ "$BBR_TUNING_REVISION" == 5 ]]
+          [[ "$BBR_TUNING_REVISION" == 6 ]]
           [[ "$BBR_BW_RTTS" == 10 ]]
+          [[ "$BBR_MIN_RTT_WIN_SEC" == 15 ]]
+          [[ "$BBR_PROBE_RTT_CWND_GAIN_PERCENT" == 50 ]]
+          [[ "$BBR_PROBE_BW_GAIN_PERCENT" == 150 ]]
+          [[ "$BBR_PROBE_BW_DRAIN_PERCENT" == 62 ]]
           [[ "$BBR_PIXIE_FEEDBACK_ENTRY_RTTS" == 1 ]]
           [[ "$BBR_PIXIE_FEEDBACK_EXIT_RTTS" == 4 ]]
           [[ "$BBR_PIXIE_MIN_SAMPLES" == 32 ]]
+          [[ "$BBR_PIXIE_DEADBAND_BPS" == 50 ]]
           [[ "$BBR_PIXIE_MAX_GAIN_PERCENT" == 150 ]]
+          [[ "$BBR_PIXIE_PROBE_MAX_GAIN_PERCENT" == 187 ]]
+          [[ "$BBR_PIXIE_CWND_MAX_GAIN_PERCENT" == 250 ]]
           [[ "$BBR_LT_LOSS_THRESH" == 96 ]]
           [[ "$BBR_LT_BW_MAX_RTTS" == 24 ]]
+          [[ "$FQ_DEFAULT_PLIMIT" == 32768 ]]
+          [[ "$FQ_DEFAULT_FLOW_PLIMIT" == 2000 ]]
+          [[ "$FQ_DEFAULT_BUCKETS" == 4096 ]]
           [[ "$LINUX_SOURCE_SHA256" =~ ^[0-9a-f]{64}$ ]]
 
           recipe_files=(
             .github/workflows/build-aggressive-kernel.yml
             metadata/aggressive-bbr.env
             scripts/apply-aggressive-bbr.py
+            scripts/apply-fq-tuning.py
             scripts/fetch-verified-linux.sh
             scripts/prepare-kernel-config.sh
             scripts/resolve-linux-source.sh
@@ -90,9 +101,14 @@ jobs:
           build_sha256=$(
             printf '%s\n' \
               "$BBR_TUNING_REVISION" "$BBR_BW_RTTS" \
+              "$BBR_MIN_RTT_WIN_SEC" "$BBR_PROBE_RTT_CWND_GAIN_PERCENT" \
+              "$BBR_PROBE_BW_GAIN_PERCENT" "$BBR_PROBE_BW_DRAIN_PERCENT" \
               "$BBR_PIXIE_FEEDBACK_ENTRY_RTTS" "$BBR_PIXIE_FEEDBACK_EXIT_RTTS" \
-              "$BBR_PIXIE_MIN_SAMPLES" "$BBR_PIXIE_MAX_GAIN_PERCENT" \
+              "$BBR_PIXIE_MIN_SAMPLES" "$BBR_PIXIE_DEADBAND_BPS" \
+              "$BBR_PIXIE_MAX_GAIN_PERCENT" "$BBR_PIXIE_PROBE_MAX_GAIN_PERCENT" \
+              "$BBR_PIXIE_CWND_MAX_GAIN_PERCENT" \
               "$BBR_LT_LOSS_THRESH" "$BBR_LT_BW_MAX_RTTS" \
+              "$FQ_DEFAULT_PLIMIT" "$FQ_DEFAULT_FLOW_PLIMIT" "$FQ_DEFAULT_BUCKETS" \
               "$LINUX_SOURCE_SHA256" "$recipe_sha256" \
               | sha256sum | awk '{ print $1 }'
           )
@@ -161,13 +177,16 @@ jobs:
           tar -C build -xf build/linux.tar.xz
           mv "build/linux-${UPSTREAM_KERNEL_VERSION}" build/linux
 
-      - name: Verify upstream BBR source
+      - name: Verify upstream BBR and FQ sources
         working-directory: build/linux
         run: |
           set -euo pipefail
           test -f net/ipv4/tcp_bbr.c
+          test -f net/sched/sch_fq.c
           grep -Fq '"bbr"' net/ipv4/tcp_bbr.c
+          grep -Fq '"fq"' net/sched/sch_fq.c
           sha256sum net/ipv4/tcp_bbr.c > "$GITHUB_WORKSPACE/build/upstream-bbr.sha256"
+          sha256sum net/sched/sch_fq.c > "$GITHUB_WORKSPACE/build/upstream-fq.sha256"
 
       - name: Apply aggressive BBR loss compensation
         working-directory: build/linux
@@ -177,51 +196,75 @@ jobs:
             net/ipv4/tcp_bbr.c "$GITHUB_WORKSPACE/build/bbr-tuning.env"
           source "$GITHUB_WORKSPACE/build/bbr-tuning.env"
           [[ "$BBR_BW_RTTS" == 10 ]]
+          [[ "$BBR_MIN_RTT_WIN_SEC" == 15 ]]
+          [[ "$BBR_PROBE_RTT_CWND_GAIN_PERCENT" == 50 ]]
+          [[ "$BBR_PROBE_BW_GAIN_PERCENT" == 150 ]]
+          [[ "$BBR_PROBE_BW_DRAIN_PERCENT" == 62 ]]
           [[ "$BBR_PIXIE_FEEDBACK_ENTRY_RTTS" == 1 ]]
           [[ "$BBR_PIXIE_FEEDBACK_EXIT_RTTS" == 4 ]]
           [[ "$BBR_PIXIE_MIN_SAMPLES" == 32 ]]
-          [[ "$BBR_PIXIE_FEEDBACK_WINDOW" == adaptive_hysteresis_completed_rounds ]]
+          [[ "$BBR_PIXIE_DEADBAND_BPS" == 50 ]]
+          [[ "$BBR_PIXIE_FEEDBACK_WINDOW" == adaptive_hysteresis_q12_probe_bw_rounds ]]
           [[ "$BBR_PIXIE_MAX_GAIN_PERCENT" == 150 ]]
+          [[ "$BBR_PIXIE_PROBE_MAX_GAIN_PERCENT" == 187 ]]
+          [[ "$BBR_PIXIE_CWND_MAX_GAIN_PERCENT" == 250 ]]
+          [[ "$BBR_PIXIE_HOTPATH_CACHED" == 1 ]]
           [[ "$BBR_PIXIE_IDLE_RESET" == 1 ]]
           [[ "$BBR_PIXIE_CWND_SATURATING_ARITHMETIC" == 1 ]]
           [[ "$BBR_PIXIE_CWND_GRADUAL_GROWTH" == 1 ]]
           [[ "$BBR_PIXIE_POLICER_MODEL" == 0 ]]
 
+      - name: Apply high-BDP fq qdisc defaults
+        working-directory: build/linux
+        run: |
+          set -euo pipefail
+          python3 "$GITHUB_WORKSPACE/scripts/apply-fq-tuning.py" \
+            net/sched/sch_fq.c "$GITHUB_WORKSPACE/build/fq-tuning.env"
+          source "$GITHUB_WORKSPACE/build/fq-tuning.env"
+          [[ "$FQ_DEFAULT_PLIMIT" == 32768 ]]
+          [[ "$FQ_DEFAULT_FLOW_PLIMIT" == 2000 ]]
+          [[ "$FQ_DEFAULT_BUCKETS" == 4096 ]]
+
       - name: Prepare cloud VPS kernel configuration
         working-directory: build/linux
         run: |
           set -euo pipefail
-          bash "$GITHUB_WORKSPACE/scripts/prepare-kernel-config.sh"
+          LLVM=1 bash "$GITHUB_WORKSPACE/scripts/prepare-kernel-config.sh"
           source "$GITHUB_WORKSPACE/build/bbr-tuning.env"
+          source "$GITHUB_WORKSPACE/build/fq-tuning.env"
           printf '%s  %s\n' "$BBR_TUNED_SOURCE_SHA256" net/ipv4/tcp_bbr.c | sha256sum --check --status
+          printf '%s  %s\n' "$FQ_TUNED_SOURCE_SHA256" net/sched/sch_fq.c | sha256sum --check --status
           cp .config "$GITHUB_WORKSPACE/build/package.config"
 
       - name: Compile Aggressive BBR with GCC
         working-directory: build/linux
         run: |
           set -euo pipefail
-          make -j"$(nproc)" net/ipv4/tcp_bbr.o
-          test -s net/ipv4/tcp_bbr.o
+          gcc_output="$GITHUB_WORKSPACE/build/linux-gcc"
+          make mrproper
+          mkdir -p "$gcc_output"
+          cp "$GITHUB_WORKSPACE/build/package.config" "$gcc_output/.config"
+          scripts/config --file "$gcc_output/.config" --disable LTO_CLANG_THIN --enable LTO_NONE
+          make O="$gcc_output" olddefconfig
+          make -j"$(nproc)" O="$gcc_output" net/ipv4/tcp_bbr.o net/sched/sch_fq.o
+          test -s "$gcc_output/net/ipv4/tcp_bbr.o"
+          test -s "$gcc_output/net/sched/sch_fq.o"
+          cp "$GITHUB_WORKSPACE/build/package.config" .config
+          make LLVM=1 olddefconfig
 
       - name: Compile Aggressive BBR with Clang
         working-directory: build/linux
         run: |
           set -euo pipefail
-          clang_output="$GITHUB_WORKSPACE/build/linux-clang"
-          make mrproper
-          mkdir -p "$clang_output"
-          cp "$GITHUB_WORKSPACE/build/package.config" "$clang_output/.config"
-          make O="$clang_output" CC=clang LLVM=1 olddefconfig
-          make -j"$(nproc)" O="$clang_output" CC=clang LLVM=1 net/ipv4/tcp_bbr.o
-          test -s "$clang_output/net/ipv4/tcp_bbr.o"
-          cp "$GITHUB_WORKSPACE/build/package.config" .config
-          make olddefconfig
+          make -j"$(nproc)" LLVM=1 net/ipv4/tcp_bbr.o net/sched/sch_fq.o
+          test -s net/ipv4/tcp_bbr.o
+          test -s net/sched/sch_fq.o
 
       - name: Build DEB packages
         working-directory: build/linux
         run: |
           set -euo pipefail
-          make -j"$(nproc)" bindeb-pkg \
+          make -j"$(nproc)" LLVM=1 bindeb-pkg \
             LOCALVERSION="$LOCALVERSION" \
             KDEB_PKGVERSION="${UPSTREAM_KERNEL_VERSION}-1+aggressive.${BUILD_SHA256:0:12}" \
             KDEB_COMPRESS=xz
@@ -231,7 +274,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$GITHUB_WORKSPACE/build/rpmbuild"/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
-          make -j"$(nproc)" binrpm-pkg \
+          make -j"$(nproc)" LLVM=1 binrpm-pkg \
             LOCALVERSION="$LOCALVERSION" \
             RPMOPTS="--define '_topdir $GITHUB_WORKSPACE/build/rpmbuild'"
           find "$GITHUB_WORKSPACE/build/rpmbuild/RPMS" -type f -name '*.rpm' -exec cp -f {} "$GITHUB_WORKSPACE/build/" \;
@@ -239,7 +282,7 @@ jobs:
       - name: Validate packages and create manifest fragment
         run: |
           set -euo pipefail
-          kernel_release="$(make -s -C build/linux kernelrelease)"
+          kernel_release="$(make -s -C build/linux LLVM=1 kernelrelease)"
 
           deb_contains_kernel() {
             dpkg-deb --contents "$1" 2>/dev/null \
@@ -308,6 +351,7 @@ jobs:
           source metadata/aggressive-bbr.env
           source build/linux-source-provenance.env
           source build/bbr-tuning.env
+          source build/fq-tuning.env
           final_config_sha256=$(sha256sum build/linux/.config | awk '{ print $1 }')
 
           jq -n \
@@ -316,14 +360,26 @@ jobs:
             --arg kernel_release "$kernel_release" \
             --arg source_sha256 "$BBR_STOCK_SOURCE_SHA256" \
             --arg built_source_sha256 "$BBR_TUNED_SOURCE_SHA256" \
+            --arg fq_source_sha256 "$FQ_STOCK_SOURCE_SHA256" \
+            --arg fq_built_source_sha256 "$FQ_TUNED_SOURCE_SHA256" \
             --arg tuning_revision "$BBR_TUNING_REVISION" \
             --arg bw_rtts "$BBR_BW_RTTS" \
+            --arg min_rtt_win_sec "$BBR_MIN_RTT_WIN_SEC" \
+            --arg probe_rtt_cwnd_gain_percent "$BBR_PROBE_RTT_CWND_GAIN_PERCENT" \
+            --arg probe_bw_gain_percent "$BBR_PROBE_BW_GAIN_PERCENT" \
+            --arg probe_bw_drain_percent "$BBR_PROBE_BW_DRAIN_PERCENT" \
             --arg feedback_entry_rtts "$BBR_PIXIE_FEEDBACK_ENTRY_RTTS" \
             --arg feedback_exit_rtts "$BBR_PIXIE_FEEDBACK_EXIT_RTTS" \
             --arg min_samples "$BBR_PIXIE_MIN_SAMPLES" \
+            --arg deadband_bps "$BBR_PIXIE_DEADBAND_BPS" \
             --arg max_gain_percent "$BBR_PIXIE_MAX_GAIN_PERCENT" \
+            --arg probe_max_gain_percent "$BBR_PIXIE_PROBE_MAX_GAIN_PERCENT" \
+            --arg cwnd_max_gain_percent "$BBR_PIXIE_CWND_MAX_GAIN_PERCENT" \
             --arg lt_loss_thresh "$BBR_LT_LOSS_THRESH" \
             --arg lt_bw_max_rtts "$BBR_LT_BW_MAX_RTTS" \
+            --arg fq_default_plimit "$FQ_DEFAULT_PLIMIT" \
+            --arg fq_default_flow_plimit "$FQ_DEFAULT_FLOW_PLIMIT" \
+            --arg fq_default_buckets "$FQ_DEFAULT_BUCKETS" \
             --arg linux_source_sha256 "$LINUX_SOURCE_SHA256" \
             --arg linux_signing_fingerprint "$LINUX_SOURCE_SIGNING_FINGERPRINT" \
             --arg recipe_sha256 "$RECIPE_SHA256" \
@@ -339,14 +395,26 @@ jobs:
               algorithm: {
                 name: "bbr", source: "linux-mainline", source_file: "net/ipv4/tcp_bbr.c",
                 source_sha256: $source_sha256, built_source_sha256: $built_source_sha256,
+                qdisc_source_file: "net/sched/sch_fq.c",
+                qdisc_source_sha256: $fq_source_sha256, qdisc_built_source_sha256: $fq_built_source_sha256,
                 tuning: {
                   revision: ($tuning_revision | tonumber), bw_rtts: ($bw_rtts | tonumber),
+                  min_rtt_win_sec: ($min_rtt_win_sec | tonumber),
+                  probe_rtt_cwnd_gain_percent: ($probe_rtt_cwnd_gain_percent | tonumber),
+                  probe_bw_gain_percent: ($probe_bw_gain_percent | tonumber),
+                  probe_bw_drain_percent: ($probe_bw_drain_percent | tonumber),
                   feedback_entry_rtts: ($feedback_entry_rtts | tonumber),
                   feedback_exit_rtts: ($feedback_exit_rtts | tonumber),
                   min_samples: ($min_samples | tonumber),
+                  deadband_bps: ($deadband_bps | tonumber),
                   max_gain_percent: ($max_gain_percent | tonumber),
+                  probe_max_gain_percent: ($probe_max_gain_percent | tonumber),
+                  cwnd_max_gain_percent: ($cwnd_max_gain_percent | tonumber),
                   lt_loss_thresh: ($lt_loss_thresh | tonumber),
-                  lt_bw_max_rtts: ($lt_bw_max_rtts | tonumber)
+                  lt_bw_max_rtts: ($lt_bw_max_rtts | tonumber),
+                  fq_default_plimit: ($fq_default_plimit | tonumber),
+                  fq_default_flow_plimit: ($fq_default_flow_plimit | tonumber),
+                  fq_default_buckets: ($fq_default_buckets | tonumber)
                 },
                 linux_source_sha256: $linux_source_sha256,
                 linux_signing_fingerprint: $linux_signing_fingerprint,
@@ -403,6 +471,8 @@ jobs:
             (map(.algorithm.source) | unique) == ["linux-mainline"] and
             (map(.algorithm.source_sha256) | unique | length) == 1 and
             (map(.algorithm.built_source_sha256) | unique | length) == 1 and
+            (map(.algorithm.qdisc_source_sha256) | unique | length) == 1 and
+            (map(.algorithm.qdisc_built_source_sha256) | unique | length) == 1 and
             (map(.algorithm.build_sha256) | unique | length) == 1
           ' build/manifest-*.json >/dev/null
 
@@ -438,10 +508,11 @@ jobs:
           Linux Aggressive Kernel ${UPSTREAM_KERNEL_VERSION} for amd64/x86_64 and arm64/aarch64.
 
           - Stable Linux source: v${UPSTREAM_KERNEL_VERSION} from kernel.org, signature verified
+          - Toolchain: Clang + ThinLTO (LLVM=1, CONFIG_LTO_CLANG_THIN=y)
           - Packages: DEB and RPM
-          - Congestion control: BBRv1 with bounded Pixie ACK/loss compensation (${BUILD_SHA256:0:12})
-          - Maximum pacing/cwnd compensation: 1.5x
-          - Default qdisc: fq
+          - Congestion control: BBRv1 rev6 with 0.5*BDP PROBE_RTT (15s), 1.50x/0.625x ProbeBW, phase-decoupled cached Q12 Pixie loss compensation (0.5% deadband, 1.50x cap), and queue-aware drain (${BUILD_SHA256:0:12})
+          - Default qdisc: fq (high-BDP tuned defaults: limit=32768, flow_plimit=2000, buckets=4096)
+          - Cloud VPS datapath: nftables Flowtable offload, TPROXY/policy routing, kTLS, WireGuard, PREEMPT_LAZY + HZ_250
           - Kernel release suffix: -aggressive
           EOF
 
