@@ -436,6 +436,7 @@ log "Writing network parameters to $SYSCTL_FILE..."
 cat > "$SYSCTL_FILE" <<'SYSCTL'
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
+net.ipv4.tcp_notsent_lowat = 131072
 net.core.rmem_max = 67108864
 net.core.wmem_max = 67108864
 net.ipv4.tcp_rmem = 4096 1048576 67108864
